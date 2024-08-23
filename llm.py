@@ -3,6 +3,7 @@ import struct
 
 import cupy
 import cupyx
+import numba.cuda
 import numpy
 
 from cuda import cuda, cudart, nvrtc
@@ -180,7 +181,7 @@ def malloc_and_point_parameters(params, param_sizes, num_parameters):
     # Use a cupy view instead of a raw pointer
     current_size = 0
     for i, n in enumerate(params.names):
-        setattr(params, n, params_memory[current_size:])
+        setattr(params, n, params_memory[current_size:current_size+param_sizes[i]])
         current_size += param_sizes[i]
 
     return params_memory
@@ -265,10 +266,38 @@ def malloc_and_point_activations(acts, act_sizes, num_activations):
     acts_memory = cupy.empty(num_activations, dtype=cupy.float32)
     current_size = 0
     for i, n in enumerate(acts.names):
-        setattr(acts, n, acts_memory[current_size:])
+        setattr(acts, n, acts_memory[current_size:current_size+act_sizes[i]])
         current_size += act_sizes[i]
 
     return acts_memory
+
+
+@numba.cuda.jit(device=True)
+def i2n(idx, E1, E2):
+    bt = idx // E1
+    b = bt // E2
+    t = bt % E2
+    c = idx % E1
+    return (b, t, c)
+
+
+@numba.cuda.jit
+def encoder_forward_kernel(out_md, wte_md, wpe_md, inp_md, C, T):
+    idx = numba.cuda.grid(1)
+    # Ensure the thread is within the bounds of the array
+    if idx < out_md.size:
+        b, t, c = i2n(idx, C, T)
+        out_md[b, t, c] = wte_md[inp_md[b, t], c] + wpe_md[t, c]
+   
+
+def encoder_forward(out, inpv, wte, wpe, B, T, C, V):
+    out_md = out.reshape(B, T, C)
+    wte_md = wte.reshape(V, C)
+    wpe_md = wpe.reshape(T, C)
+    inp_md = inpv.reshape(B, T)
+    threads_per_block = 256  
+    blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
+    encoder_forward_kernel[blocks_per_grid, threads_per_block](out_md, wte_md, wpe_md, inp_md, C, T)
 
  
 class GPT2:
@@ -391,16 +420,27 @@ class GPT2:
             acts_memory = int(round(num_activations * cupy.dtype(cupy.float32).itemsize / (1024 * 1024)))
             print(f"allocated {acts_memory} MiB for activations")
             # Regular memory allocations
-            self.inputs = cupy.empty((B * T), dtype=cupy.int32);
-            self.target = cupy.empty((B * T), dtype=cupy.int32);
-            self.cpu_losses = cupy.empty((B * T), dtype=cupy.float32);
+            # self.inputs = cupy.empty((B * T), dtype=cupy.int32);
+            # self.target = cupy.empty((B * T), dtype=cupy.int32);
+            # self.cpu_losses = cupy.empty((B * T), dtype=cupy.float32);
         else:
             # validate B,T is consistent with how we've allocated the memory before
             # in principle we could get more clever here in the future, for now this is safest
             if (B != self.batch_size or T != self.seq_len):
                 raise RuntimeError(f"Model: B={self.batch_size} T={self.seq_len}, Desired: B={B} T={T}")
 
+        # copy inputs/targets to the model
+        # We are just creating a new cupy array time, memory is drawn from the pool and the numpy array
+        # with the inputs is in pinned memory
+        self.inputs = cupy.array(inputs)
+        if targets is not None:
+            self.targets = cupy.array(targets)
 
+        # forward pass
+        params = self.params
+        acts = self.acts
+        encoder_forward(acts.encoded, self.inputs, params.wte, params.wpe, B, T, C, V)
+        print(acts.encoded)
 
 def main():
     # Default values
@@ -478,8 +518,6 @@ def main():
             val_loader.reset()
             for i in range(val_num_batches):
                 val_loader.next_batch()
-                print(val_loader.inputs())
-                print(val_loader.targets())
                 model.forward(val_loader.inputs(), val_loader.targets(), B, T)
                 sys.exit(0)
                 #val_loss += model.mean_loss
