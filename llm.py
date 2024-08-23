@@ -1,5 +1,7 @@
+import math
 import os
 import struct
+import sys
 
 import cupy
 import cupyx
@@ -38,6 +40,111 @@ def checkCudaErrors(result):
         return result[1]
     else:
         return result[1:]
+
+"""
+--------------------- KERNELS ---------------------
+"""
+
+@numba.cuda.jit
+def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
+
+    # This emulates the warp cg which is not available in numba
+    warp_size = 32
+    meta_group_size = numba.cuda.blockDim.x // warp_size;
+    meta_group_rank = numba.cuda.threadIdx.x // warp_size;
+    thread_rank = numba.cuda.threadIdx.x % warp_size
+    idx = numba.cuda.blockIdx.x * meta_group_size + meta_group_rank
+    # Ensure the thread is within the bounds of the array
+    if idx >= N:
+        return
+    # Space so all the threads can share partial data
+    sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
+
+    #mean
+    sums[numba.cuda.threadIdx.x] = 0
+    x = inp[idx * C:]
+    for i in range(thread_rank, C, warp_size):
+        sums[numba.cuda.threadIdx.x] += x[i]
+
+    # TODO support CG Reduction, right now we do it naively
+    numba.cuda.syncthreads()
+    if (thread_rank == 0):
+        for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
+            sums[meta_group_rank * warp_size] +=  sums[i]
+    numba.cuda.syncthreads()
+    m = sums[meta_group_rank * warp_size] / C
+    if (thread_rank == 0):
+        mean[idx] = m
+
+    # rstd
+    sums[numba.cuda.threadIdx.x] = 0
+    for i in range(thread_rank, C, warp_size):
+        diff = x[i] - m
+        sums[numba.cuda.threadIdx.x] += diff * diff
+
+    numba.cuda.syncthreads()
+    if (thread_rank == 0):
+        for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
+            sums[meta_group_rank * warp_size] +=  sums[i]
+    numba.cuda.syncthreads()
+      
+    s = sums[meta_group_rank * warp_size]
+    s = 1.0/ math.sqrt(s / C + 1e-5)
+
+    if (thread_rank == 0):
+        rstd[idx] = s
+
+    # final normalization and scaling by weight/bias
+    o = out[idx * C:]
+    for c in range(thread_rank, C, warp_size):
+        n = s  * x[c] - m
+        o[c] = n *weight[c] + bias[c]
+
+
+def layernorm_forward(out, mean,  rstd, inp, weight, bias, B, T, C):
+    def ceil_div(a, b):
+        return -(a // -b)
+
+    block_size = 512
+    N = B * T
+    grid_size = ceil_div(N * 32, block_size)
+    layernorm_forward_kernel3[grid_size, block_size](out, mean, rstd, inp, weight, bias, N, C)
+
+
+@numba.cuda.jit(device=True)
+def i2n(idx, E1, E2):
+    bt = idx // E1
+    b = bt // E2
+    t = bt % E2
+    c = idx % E1
+    return (b, t, c)
+
+
+@numba.cuda.jit
+def encoder_forward_kernel(out_md, wte_md, wpe_md, inp_md, C, T):
+    idx = numba.cuda.grid(1)
+    # Ensure the thread is within the bounds of the array
+    if idx < out_md.size:
+        b, t, c = i2n(idx, C, T)
+        out_md[b, t, c] = wte_md[inp_md[b, t], c] + wpe_md[t, c]
+   
+
+def encoder_forward(out, inpv, wte, wpe, B, T, C, V):
+    out_md = out.reshape(B, T, C)
+    wte_md = wte.reshape(V, C)
+    wpe_md = wpe.reshape(T, C)
+    inp_md = inpv.reshape(B, T)
+    threads_per_block = 256  
+    blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
+    encoder_forward_kernel[blocks_per_grid, threads_per_block](out_md, wte_md, wpe_md, inp_md, C, T)
+
+
+
+"""
+---------------------------------------------------
+"""
+
+
 
 #TODO(ecastill) Use torch DataLoader instead?
 class DataLoader:
@@ -272,34 +379,6 @@ def malloc_and_point_activations(acts, act_sizes, num_activations):
     return acts_memory
 
 
-@numba.cuda.jit(device=True)
-def i2n(idx, E1, E2):
-    bt = idx // E1
-    b = bt // E2
-    t = bt % E2
-    c = idx % E1
-    return (b, t, c)
-
-
-@numba.cuda.jit
-def encoder_forward_kernel(out_md, wte_md, wpe_md, inp_md, C, T):
-    idx = numba.cuda.grid(1)
-    # Ensure the thread is within the bounds of the array
-    if idx < out_md.size:
-        b, t, c = i2n(idx, C, T)
-        out_md[b, t, c] = wte_md[inp_md[b, t], c] + wpe_md[t, c]
-   
-
-def encoder_forward(out, inpv, wte, wpe, B, T, C, V):
-    out_md = out.reshape(B, T, C)
-    wte_md = wte.reshape(V, C)
-    wpe_md = wpe.reshape(T, C)
-    inp_md = inpv.reshape(B, T)
-    threads_per_block = 256  
-    blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
-    encoder_forward_kernel[blocks_per_grid, threads_per_block](out_md, wte_md, wpe_md, inp_md, C, T)
-
- 
 class GPT2:
     def __init__(self):
         # We just replicate the c++ structure, we could use cupy tensors & views for this
@@ -440,7 +519,45 @@ class GPT2:
         params = self.params
         acts = self.acts
         encoder_forward(acts.encoded, self.inputs, params.wte, params.wpe, B, T, C, V)
-        print(acts.encoded)
+        for l in range(L):
+
+            residual = acts.encoded if l == 0 else acts.residual3[(l-1) * B * T * C:]
+
+            l_ln1w = params.ln1w [l * C:]
+            l_ln1b = params.ln1b [l * C:]
+            l_qkvw = params.qkvw [l * 3*C * C:]
+            l_qkvb = params.qkvb [l * 3*C:]
+            l_attprojw = params.attprojw[l * C * C:]
+            l_attprojb = params.attprojb[l * C:]
+            l_ln2w = params.ln2w[l * C:]
+            l_ln2b = params.ln2b[l * C:]
+            l_fcw = params.fcw[l * 4*C * C:]
+            l_fcb = params.fcb[l * 4*C:]
+            l_fcprojw = params.fcprojw[l * C * 4*C:]
+            l_fcprojb = params.fcprojb[l * C:]
+
+            l_ln1 = acts.ln1[l * B * T * C:]
+            l_ln1_mean = acts.ln1_mean[l * B * T:]
+            l_ln1_rstd = acts.ln1_rstd[l * B * T:]
+            l_qkv = acts.qkv[l * B * T * 3*C:]
+            l_qkvr = acts.qkvr[l * B * T * 3*C:]
+            l_atty = acts.atty[l * B * T * C:]
+            l_att = acts.att[l * B * NH * T * T:]
+            l_attproj = acts.attproj[l * B * T * C:]
+            l_residual2 = acts.residual2[l * B * T * C:]
+            l_ln2 = acts.ln2[l * B * T * C:]
+            l_ln2_mean = acts.ln2_mean[l * B * T:]
+            l_ln2_rstd = acts.ln2_rstd[l * B * T:]
+            l_fch = acts.fch[l * B * T * 4*C:]
+            l_fch_gelu = acts.fch_gelu[l * B * T * 4*C:]
+            l_fcproj = acts.fcproj[l * B * T * C:]
+            l_residual3 = acts.residual3[l * B * T * C:]
+
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
+            for i in range(B*T*C -50, B*T*C, 2):
+                print(l_ln1[i], ' ', l_ln1[i+1])
+            #print(C, residual.shape, l_ln1_mean.shape)
+            sys.exit(0)
 
 def main():
     # Default values
