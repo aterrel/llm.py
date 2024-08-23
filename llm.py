@@ -9,7 +9,8 @@ import numba.cuda
 import numpy
 
 from cuda import cuda, cudart, nvrtc
-from nvmath.bindings import cublas, cublasLt
+from nvmath.bindings import cublas
+from nvmath.bindings import cublasLt as cublaslt
 
 
 cublaslt_workspace_size = 32 * 1024 * 1024
@@ -111,6 +112,84 @@ def layernorm_forward(out, mean,  rstd, inp, weight, bias, B, T, C):
     layernorm_forward_kernel3[grid_size, block_size](out, mean, rstd, inp, weight, bias, N, C)
 
 
+def cublaslt_setattr(matmul_desc, name, value):
+    name = name.upper()
+    DescEnum = cublaslt.MatmulDescAttribute 
+    scalar_attrs =  [e.name for e in DescEnum] 
+    if name not in scalar_attrs:
+        return 
+    get_dtype = cublaslt.get_matmul_desc_attribute_dtype
+    attribute_buffer = numpy.zeros((1,), dtype=get_dtype(DescEnum[name]))
+    attribute_buffer[0] = value
+    cublaslt.matmul_desc_set_attribute(matmul_desc, DescEnum[name].value, attribute_buffer.ctypes.data, attribute_buffer.itemsize)
+
+def cublaslt_set_preference_attr(preference, name, value):
+    name = name.upper()
+    PreferenceEnum = cublaslt.MatmulPreferenceAttribute
+    scalar_attrs =  [e.name for e in PreferenceEnum] 
+    if name not in scalar_attrs:
+        return 
+    get_dtype = cublaslt.get_matmul_preference_attribute_dtype
+    attribute_buffer = numpy.zeros((1,), dtype=get_dtype(PreferenceEnum[name]))
+    attribute_buffer[0] = value
+    cublaslt.matmul_preference_set_attribute(preference, PreferenceEnum[name].value, attribute_buffer.ctypes.data, attribute_buffer.itemsize)
+
+
+def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
+    has_bias = (bias is not None);
+
+    # check bias alignment
+    if bias.data.ptr % 16 != 0:
+        raise RuntimeError("Bias pointer is not aligned (cuBLASLt requirement)!\n")
+
+    returnedResults = 0
+    # create the operation descriptor
+    opNoTranspose = cublas.Operation.N
+    opTranspose = cublas.Operation.T
+    epilogueBias = cublaslt.Epilogue.BIAS
+    cuda_r_32f = cudart.cudaDataType.CUDA_R_32F
+    operation_desc = cublaslt.matmul_desc_create(cublas_compute_type, cuda_r_32f)
+    cublaslt_setattr(operation_desc, "TRANSA", opTranspose)
+    cublaslt_setattr(operation_desc, "TRANSB", opNoTranspose)
+    cublaslt_setattr(operation_desc, "EPILOGUE", epilogueBias)
+    if has_bias:
+        cublaslt_setattr(operation_desc, "BIAS_POINTER", bias.data.ptr)
+    weight_layout = cublaslt.matrix_layout_create(cuda_r_32f, C, OC, C) 
+    input_layout = cublaslt.matrix_layout_create(cuda_r_32f, C, B*T, C) 
+    output_layout = cublaslt.matrix_layout_create(cuda_r_32f, OC, B*T, OC) 
+    bias_layout = cublaslt.matrix_layout_create(cuda_r_32f, OC, 1, OC) 
+    preference = cublaslt.matmul_preference_create()
+    cublaslt_set_preference_attr(preference, "MAX_WORKSPACE_BYTES", cublaslt_workspace_size)
+
+
+    # find a suitable algorithm
+    algorithm_dtype = algorithm_dtype = numpy.dtype([('algorithm', numpy.uint64, (8,)), ('workspace_size', numpy.uint64), ('status', numpy.int32), ('waves_count', numpy.float32), ('reserved', numpy.int32, (4,))])
+    algorithms_buffer  = numpy.zeros((1,), dtype=algorithm_dtype)
+    num_algorithms = numpy.zeros((1,), dtype=numpy.int32)
+    print("Algorithm")
+    cublaslt.matmul_algo_get_heuristic(
+        cublaslt_handle, operation_desc, weight_layout, input_layout, output_layout, output_layout, preference, 1, algorithms_buffer.ctypes.data, num_algorithms.ctypes.data
+    )
+    print("Algorithm ", num_algorithms)
+    if num_algorithms[0] == 0:
+        raise RuntimeError(f"No cuBLASLt algorithm: B: {B}, T: {T}, C: {C}, OC: {OC}, bias: {has_bias}")
+
+    # call matmul
+    alpha = numpy.array(1.0, dtype=numpy.float32)
+    beta = numpy.array(0.0, dtype=numpy.float32)
+    cublaslt.matmul(cublaslt_handle, operation_desc,
+        alpha.ctypes.data, weight.data.ptr, weight_layout, inp.data.ptr, input_layout, beta.ctypes.data,
+        out.data.ptr, output_layout, out.data.ptr, output_layout, algorithms_buffer[0]['algorithm'].ctypes.data,
+        cublaslt_workspace.data.ptr, cublaslt_workspace_size, 0)
+
+    cublaslt.matmul_preference_destroy(preference)
+    cublaslt.matmul_desc_destroy(operation_desc)
+    cublaslt.matrix_layout_destroy(weight_layout)
+    cublaslt.matrix_layout_destroy(input_layout)
+    cublaslt.matrix_layout_destroy(output_layout)
+    cublaslt.matrix_layout_destroy(bias_layout)
+
+
 @numba.cuda.jit(device=True)
 def i2n(idx, E1, E2):
     bt = idx // E1
@@ -137,8 +216,6 @@ def encoder_forward(out, inpv, wte, wpe, B, T, C, V):
     threads_per_block = 256  
     blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
     encoder_forward_kernel[blocks_per_grid, threads_per_block](out_md, wte_md, wpe_md, inp_md, C, T)
-
-
 
 """
 ---------------------------------------------------
@@ -554,12 +631,19 @@ class GPT2:
             l_residual3 = acts.residual3[l * B * T * C:]
 
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
-            for i in range(B*T*C -50, B*T*C, 2):
-                print(l_ln1[i], ' ', l_ln1[i+1])
             #print(C, residual.shape, l_ln1_mean.shape)
+            matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C)
+            for i in range(B*T*C -50, B*T*C, 2):
+                print(l_qkv[i], ' ', l_qkv[i+1])
             sys.exit(0)
 
 def main():
+    global cublaslt_workspace_size
+    global cublaslt_workspace
+    global cublas_compute_type
+    global cublas_handle
+    global cublaslt_handle
+
     # Default values
     input_dataset_prefix = "data/tiny_shakespeare"
     output_log_file = None
@@ -589,7 +673,7 @@ def main():
     print(f"Device {deviceIdx}: {deviceProp.name.decode('utf-8')}")
     # For nvmath errors are thrown in a pythonic way
     cublas_handle = cublas.create()
-    cublaslt_handle = cublasLt.create()
+    cublaslt_handle = cublaslt.create()
     enable_tf32 = deviceProp.major >= 8
     print(f"enable_tf32: {enable_tf32}")
     if enable_tf32: 
