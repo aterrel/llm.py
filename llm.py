@@ -46,6 +46,31 @@ def checkCudaErrors(result):
 --------------------- KERNELS ---------------------
 """
 
+@numba.cuda.jit(device=True)
+def warp_sum(meta_group_rank, thread_rank, warp_size, sum):
+    sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
+    sums[numba.cuda.threadIdx.x] = sum
+    numba.cuda.syncthreads()
+    if (thread_rank == 0):
+        for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
+            sums[meta_group_rank * warp_size] += sums[i]
+    numba.cuda.syncthreads()
+    # divide the whole row by the sum
+    return sums[meta_group_rank * warp_size]
+
+@numba.cuda.jit(device=True)
+def warp_max(meta_group_rank, thread_rank, warp_size, sum):
+    sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
+    sums[numba.cuda.threadIdx.x] = sum
+    numba.cuda.syncthreads()
+    if (thread_rank == 0):
+        for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
+            sums[meta_group_rank * warp_size] =  numba.cuda.libdevice.fmaxf(sums[meta_group_rank * warp_size], sums[i])
+    numba.cuda.syncthreads()
+    # divide the whole row by the sum
+    return sums[meta_group_rank * warp_size]
+
+
 @numba.cuda.jit
 def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
 
@@ -62,35 +87,23 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
 
     #mean
-    sums[numba.cuda.threadIdx.x] = 0
+    sum = 0
     x = inp[idx * C:]
     for i in range(thread_rank, C, warp_size):
-        sums[numba.cuda.threadIdx.x] += x[i]
+        sum += x[i]
 
-    # TODO support CG Reduction, right now we do it naively
-    numba.cuda.syncthreads()
-    if (thread_rank == 0):
-        for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
-            sums[meta_group_rank * warp_size] +=  sums[i]
-    numba.cuda.syncthreads()
-    m = sums[meta_group_rank * warp_size] / C
+    m = warp_sum(meta_group_rank, thread_rank, warp_size, sum) / C
     if (thread_rank == 0):
         mean[idx] = m
 
     # rstd
-    sums[numba.cuda.threadIdx.x] = 0
+    sum = 0
     for i in range(thread_rank, C, warp_size):
         diff = x[i] - m
-        sums[numba.cuda.threadIdx.x] += diff * diff
+        sum += diff * diff
 
-    numba.cuda.syncthreads()
-    if (thread_rank == 0):
-        for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
-            sums[meta_group_rank * warp_size] +=  sums[i]
-    numba.cuda.syncthreads()
-      
-    s = sums[meta_group_rank * warp_size]
-    s = 1.0/ math.sqrt(s / C + 1e-5)
+    s = warp_sum(meta_group_rank, thread_rank, warp_size, sum)
+    s = numba.cuda.libdevice.rsqrt(s / C + 1e-5)
 
     if (thread_rank == 0):
         rstd[idx] = s
@@ -101,10 +114,10 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
         n = s  * x[c] - m
         o[c] = n *weight[c] + bias[c]
 
+def ceil_div(a, b):
+    return -(a // -b)
 
 def layernorm_forward(out, mean,  rstd, inp, weight, bias, B, T, C):
-    def ceil_div(a, b):
-        return -(a // -b)
 
     block_size = 512
     N = B * T
@@ -166,11 +179,9 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     algorithm_dtype = algorithm_dtype = numpy.dtype([('algorithm', numpy.uint64, (8,)), ('workspace_size', numpy.uint64), ('status', numpy.int32), ('waves_count', numpy.float32), ('reserved', numpy.int32, (4,))])
     algorithms_buffer  = numpy.zeros((1,), dtype=algorithm_dtype)
     num_algorithms = numpy.zeros((1,), dtype=numpy.int32)
-    print("Algorithm")
     cublaslt.matmul_algo_get_heuristic(
         cublaslt_handle, operation_desc, weight_layout, input_layout, output_layout, output_layout, preference, 1, algorithms_buffer.ctypes.data, num_algorithms.ctypes.data
     )
-    print("Algorithm ", num_algorithms)
     if num_algorithms[0] == 0:
         raise RuntimeError(f"No cuBLASLt algorithm: B: {B}, T: {T}, C: {C}, OC: {OC}, bias: {has_bias}")
 
@@ -190,8 +201,131 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     cublaslt.matrix_layout_destroy(bias_layout)
 
 
+
+@numba.cuda.jit
+def softmax_forward_kernel5(out, inv_temperature, inp, N, T):
+    # inp, out shape: (N, T, T), where N = B * NH
+    # fuses the multiplication by scale inside attention
+    # directly autoregressive, so we only compute the lower triangular part
+    # uses the online softmax algorithm
+    assert(T % 4 == 0) 
+
+    # This emulates the warp cg which is not available in numba
+    warp_size = 32
+    meta_group_size = numba.cuda.blockDim.x // warp_size;
+    meta_group_rank = numba.cuda.threadIdx.x // warp_size;
+    thread_rank = numba.cuda.threadIdx.x % warp_size
+    idx = (numba.cuda.gridDim.x - numba.cuda.blockIdx.x -1) * meta_group_size + meta_group_rank  # backward order
+    if idx >= N * T:
+        return
+    own_pos = idx % T
+    pos_by_4 = own_pos // 4
+    x = inp[idx * T:]
+    maxval = -3.402823e+38  # FLT_MAX
+    sumval = 0.0
+    for i in range(thread_rank , pos_by_4, warp_size):
+        v = x[i:i+4]
+        old_maxval = maxval
+        for k in range(4):
+            maxval = numba.cuda.libdevice.fmaxf(maxval, v[k])
+        sumval *= numba.cuda.libdevice.expf(inv_temperature * (old_maxval - maxval))
+        for k in range(4):
+            sumval += numba.cuda.libdevice.expf(inv_temperature * (v[k] - maxval))
+    if (4 * pos_by_4 + thread_rank) <= own_pos:
+        old_maxval = maxval
+        maxval = numba.cuda.libdevice.fmaxf(maxval, x[4*pos_by_4 + thread_rank])
+        sumval *= numba.cuda.libdevice.expf(inv_temperature * (old_maxval - maxval))
+        sumval += numba.cuda.libdevice.expf(inv_temperature * (x[4*pos_by_4 + thread_rank] - maxval))
+
+    global_maxval = warp_max(meta_group_rank, thread_rank, warp_size, maxval)
+    sumval *= numba.cuda.libdevice.expf(inv_temperature * (maxval - global_maxval))
+
+    # reduce sumval
+    sum = warp_sum(meta_group_rank, thread_rank, warp_size, sumval)
+    # divide the whole row by the sum
+    norm = 1.0 / sum
+
+    for i in range(thread_rank, own_pos + 1, warp_size):
+        # recalculation is faster than doing the round-trip through memory
+        ev = numba.cuda.libdevice.expf(inv_temperature * (x[i] - global_maxval))
+        out[idx * T + i] = ev * norm
+
+
 @numba.cuda.jit(device=True)
-def i2n(idx, E1, E2):
+def i2n_4(idx, E1, E2, E3):
+    b = idx // (E1 * E2 * E3)
+    rest = idx % (E1 * E2 * E3)
+    nh_ = rest // (E2 * E3)
+    rest = rest % (E2 * E3)
+    t = rest // E3
+    hs = rest % E3
+    return (b, t, nh_, hs)
+
+@numba.cuda.jit
+def qkv_inp_kernel(q, k, v, inp, NH, T, HS, size):
+    idx = numba.cuda.grid(1)
+    # Ensure the thread is within the bounds of the array
+    if idx < size:
+        b, t, nh_, hs = i2n_4(idx, NH, T, HS)
+        q[idx] = inp[b, t, 0, nh_, hs]
+        k[idx] = inp[b, t, 1, nh_, hs]
+        v[idx] = inp[b, t, 2, nh_, hs]
+   
+def qkv_inp(q, k, v, inp, NH, T, HS, size):
+    threads_per_block = 256  
+    blocks_per_grid = (size + threads_per_block - 1) // threads_per_block
+    qkv_inp_kernel[blocks_per_grid, threads_per_block](q, k, v, inp, NH, T, HS, size)
+
+
+@numba.cuda.jit
+def scatter_kernel(out, vaccum, NH, T, HS, size):
+    idx = numba.cuda.grid(1)
+    # Ensure the thread is within the bounds of the array
+    if idx < size:
+        b, n, nh_, d_ = i2n_4(idx, NH, T, HS)
+        out[(b * NH * T * HS) + (n * NH * HS) + (nh_ * HS) + d_] = vaccum[idx]
+    
+def scatter(out, vaccum, NH, T, HS, size):
+    threads_per_block = 256  
+    blocks_per_grid = (size + threads_per_block - 1) // threads_per_block
+    scatter_kernel[blocks_per_grid, threads_per_block](out, vaccum, NH, T, HS, size)
+  
+
+def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
+    block_size = 256
+    softmax_block_size = 256
+    HS = C // NH  # head size
+
+    q = qkvr[0 * B * T * C:]
+    k = qkvr[1 * B * T * C:]
+    v = qkvr[2 * B * T * C:]
+
+    inp_md = inp[:B*T*3*NH*HS].reshape((B, T, 3, NH, HS))
+    size = B * NH * T * HS
+    # Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]  
+    qkv_inp(q, k, v, inp_md, NH, T, HS, size)
+
+    # batched matrix multiply using cuBLAS
+    alpha = numpy.array(1.0, dtype=numpy.float32)
+    beta = numpy.array(0.0, dtype=numpy.float32)
+    cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.T, cublas.Operation.N, T, T, HS, alpha.ctypes.data, k.data.ptr, HS, T * HS, q.data.ptr, HS, T*HS, beta.ctypes.data, preatt.data.ptr, T, T*T, B*NH)
+
+
+    scale = 1.0 / math.sqrt(HS);
+    grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
+    softmax_forward_kernel5[grid_size, softmax_block_size](att, scale, preatt, B * NH, T)
+    # new approach: first cuBLAS another batched matmul
+    # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.N, cublas.Operation.N, HS, T, T, alpha.ctypes.data, v.data.ptr, HS, T * HS, att.data.ptr, T, T*T, beta.ctypes.data, vaccum.data.ptr, HS, T*HS, B*NH)
+      
+
+    # now unpermute
+    # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    scatter(out, vaccum, NH, T, HS, B * T * C)
+
+
+@numba.cuda.jit(device=True)
+def i2n_2(idx, E1, E2):
     bt = idx // E1
     b = bt // E2
     t = bt % E2
@@ -204,7 +338,7 @@ def encoder_forward_kernel(out_md, wte_md, wpe_md, inp_md, C, T):
     idx = numba.cuda.grid(1)
     # Ensure the thread is within the bounds of the array
     if idx < out_md.size:
-        b, t, c = i2n(idx, C, T)
+        b, t, c = i2n_2(idx, C, T)
         out_md[b, t, c] = wte_md[inp_md[b, t], c] + wpe_md[t, c]
    
 
@@ -629,12 +763,16 @@ class GPT2:
             l_fch_gelu = acts.fch_gelu[l * B * T * 4*C:]
             l_fcproj = acts.fcproj[l * B * T * C:]
             l_residual3 = acts.residual3[l * B * T * C:]
+            # these are only needed as scratchpads for the forward pass, but
+            # need not be stored for backward
+            l_preatt = acts.preatt
+            l_v_accum = acts.v_accum
 
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
-            #print(C, residual.shape, l_ln1_mean.shape)
             matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C)
-            for i in range(B*T*C -50, B*T*C, 2):
-                print(l_qkv[i], ' ', l_qkv[i+1])
+            attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH)
+            #for i in range(B*T*C -50, B*T*C, 2):
+            #    print(l_qkv[i], ' ', l_qkv[i+1])
             sys.exit(0)
 
 def main():
