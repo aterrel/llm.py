@@ -46,6 +46,7 @@ def checkCudaErrors(result):
 --------------------- KERNELS ---------------------
 """
 
+# TODO use the cuda.cooperative.experimental.warp.sum API instead
 @numba.cuda.jit(device=True)
 def warp_sum(meta_group_rank, thread_rank, warp_size, sum):
     sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
@@ -73,7 +74,6 @@ def warp_max(meta_group_rank, thread_rank, warp_size, sum):
 
 @numba.cuda.jit
 def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
-
     # This emulates the warp cg which is not available in numba
     warp_size = 32
     meta_group_size = numba.cuda.blockDim.x // warp_size;
@@ -111,14 +111,13 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     # final normalization and scaling by weight/bias
     o = out[idx * C:]
     for c in range(thread_rank, C, warp_size):
-        n = s  * x[c] - m
-        o[c] = n *weight[c] + bias[c]
+        n = s  * (x[c] - m)
+        o[c] = n * weight[c] + bias[c]
 
 def ceil_div(a, b):
     return -(a // -b)
 
 def layernorm_forward(out, mean,  rstd, inp, weight, bias, B, T, C):
-
     block_size = 512
     N = B * T
     grid_size = ceil_div(N * 32, block_size)
@@ -261,6 +260,7 @@ def i2n_4(idx, E1, E2, E3):
     hs = rest % E3
     return (b, t, nh_, hs)
 
+
 @numba.cuda.jit
 def qkv_inp_kernel(q, k, v, inp, NH, T, HS, size):
     idx = numba.cuda.grid(1)
@@ -270,6 +270,7 @@ def qkv_inp_kernel(q, k, v, inp, NH, T, HS, size):
         q[idx] = inp[b, t, 0, nh_, hs]
         k[idx] = inp[b, t, 1, nh_, hs]
         v[idx] = inp[b, t, 2, nh_, hs]
+
    
 def qkv_inp(q, k, v, inp, NH, T, HS, size):
     threads_per_block = 256  
@@ -310,7 +311,6 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
     beta = numpy.array(0.0, dtype=numpy.float32)
     cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.T, cublas.Operation.N, T, T, HS, alpha.ctypes.data, k.data.ptr, HS, T * HS, q.data.ptr, HS, T*HS, beta.ctypes.data, preatt.data.ptr, T, T*T, B*NH)
 
-
     scale = 1.0 / math.sqrt(HS);
     grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5[grid_size, softmax_block_size](att, scale, preatt, B * NH, T)
@@ -318,7 +318,6 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
     # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.N, cublas.Operation.N, HS, T, T, alpha.ctypes.data, v.data.ptr, HS, T * HS, att.data.ptr, T, T*T, beta.ctypes.data, vaccum.data.ptr, HS, T*HS, B*NH)
       
-
     # now unpermute
     # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
     scatter(out, vaccum, NH, T, HS, B * T * C)
@@ -331,6 +330,10 @@ def i2n_2(idx, E1, E2):
     t = bt % E2
     c = idx % E1
     return (b, t, c)
+
+
+def residual_forward(out, inp1, inp2, N):
+    cupy.add(inp1[:N], inp2[:N], out=out[:N])
 
 
 @numba.cuda.jit
@@ -350,6 +353,23 @@ def encoder_forward(out, inpv, wte, wpe, B, T, C, V):
     threads_per_block = 256  
     blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
     encoder_forward_kernel[blocks_per_grid, threads_per_block](out_md, wte_md, wpe_md, inp_md, C, T)
+
+@numba.cuda.jit
+def gelu_forward_kernel(out, inp, N):
+    idx = numba.cuda.grid(1)
+    if idx >= N:
+        return
+    xi = inp[idx]
+    cube = 0.044715 * xi * xi * xi
+    scaling_factor = numba.cuda.libdevice.sqrtf(2.0 / math.pi)
+    out[idx] = 0.5 * xi * (1.0 + numba.cuda.libdevice.tanhf(scaling_factor * (xi + cube)))
+
+
+def gelu_forward(out, inp, N):
+    threads_per_block = 256  
+    blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
+    gelu_forward_kernel[blocks_per_grid, threads_per_block](out, inp, N)
+
 
 """
 ---------------------------------------------------
@@ -767,13 +787,31 @@ class GPT2:
             # need not be stored for backward
             l_preatt = acts.preatt
             l_v_accum = acts.v_accum
-
+            i=0
+            print(l,'input', acts.encoded[i], ' ', acts.encoded[i+1])
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
+            print(l,'layernorm', l_ln1[i], ' ', l_ln1[i+1])
             matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C)
+            print(l,'matmul', l_qkv[i], ' ', l_qkv[i+1])
             attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH)
-            #for i in range(B*T*C -50, B*T*C, 2):
-            #    print(l_qkv[i], ' ', l_qkv[i+1])
-            sys.exit(0)
+            print(l,'att', l_atty[i], ' ', l_atty[i+1])
+            matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C)
+            print(l,'matmul2', l_attproj[i], ' ', l_attproj[i+1])
+            residual_forward(l_residual2, residual, l_attproj, B*T*C)
+            print(l,'resi', l_residual2[i], ' ', l_residual2[i+1])
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C)
+            print(l,'layernorm2', l_ln2[i], ' ', l_ln2[i+1])
+            matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C)
+            print(l,'matmul3', l_fch[i], ' ', l_fch[i+1])
+            gelu_forward(l_fch_gelu, l_fch, B*T*4*C)
+            print(l,'gelu', l_fch_gelu[i], ' ', l_fch_gelu[i+1])
+            matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C)
+            print(l,'matmul4', l_fcproj[i], ' ', l_fcproj[i+1])
+            residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C)
+            print(l,'residual', l_residual3[i], ' ', l_residual3[i+1])
+
+        residual = acts.residual3[(L-1) * B * T * C:] # last residual is in residual3
+        sys.exit(0)
 
 def main():
     global cublaslt_workspace_size
