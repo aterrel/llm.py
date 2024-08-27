@@ -43,7 +43,7 @@ def checkCudaErrors(result):
         return result[1:]
 
 """
---------------------- KERNELS ---------------------
+--------------------- FORWARD KERNELS ---------------------
 """
 
 # TODO use the cuda.cooperative.experimental.warp.sum API instead
@@ -457,10 +457,127 @@ def fused_classifier3(logits, losses, targets, B, T, V, P):
     fused_classifier_kernel3[grid_size, block_size](logits, losses, targets, B, T, V, P)
 
 """
----------------------------------------------------
+------------------------------------------------------------
+--------------------- BACKWARD KERNELS ---------------------
 """
 
+@numba.cuda.jit
+def matmul_backward_bias_kernel2(dbias, dout, B, T, OC):
+    # dout is (B, T, OC), dbias is (OC)
+    # e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
+    warp_size = 32
+    meta_group_size = numba.cuda.blockDim.x // warp_size;
+    meta_group_rank = numba.cuda.threadIdx.x // warp_size;
+    thread_rank = numba.cuda.threadIdx.x % warp_size
+    idx = numba.cuda.blockIdx.x * meta_group_size + meta_group_rank
+    if idx >= OC:
+        return
 
+    BT = B * T  # number of elements to reduce in total, per channel
+    sum = 0.0
+    # first, thread coarsening to sum reduce the problem size from B*T to 32
+    for i in range(thread_rank , BT, warp_size):
+        sum += dout[i * OC + idx]
+    # now do a warp-level reduce to get the sum across the 32 threads in this warp
+    sum = warp_sum(meta_group_rank, thread_rank, warp_size, sum)
+    # write the result to output (global memory)
+    if thread_rank == 0:
+        dbias[idx] += sum
+
+
+def matmul_backward(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC):
+    alpha = numpy.array(1.0, dtype=numpy.float32)
+    beta = numpy.array(0.0, dtype=numpy.float32)
+    # backward to input, uses = in the backward pass (set the gradient)
+    cublas.sgemm(cublas_handle, cublas.Operation.N, cublas.Operation.N, C, B*T, OC, alpha.ctypes.data, weight.data.ptr, C, dout.data.ptr, OC, beta.ctypes.data, dinp.data.ptr, C)
+    # backward to weight, uses += in the backward pass (accumulate the gradient)
+    cublas.sgemm(cublas_handle, cublas.Operation.N, cublas.Operation.T, C, OC, B*T, alpha.ctypes.data, inp.data.ptr, C, dout.data.ptr, OC, alpha.ctypes.data, dweight.data.ptr, C)
+    # backward to bias, if given, does a +=
+    if dbias is not None:
+        block_size = 512
+        grid_size = ceil_div(OC * 32, block_size)
+        matmul_backward_bias_kernel2[grid_size, block_size](dbias, dout, B, T, OC)
+
+@numba.cuda.jit
+def layernorm_backward_kernel(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C):
+    warp_size = 32
+    meta_group_size = numba.cuda.blockDim.x // warp_size;
+    meta_group_rank = numba.cuda.threadIdx.x // warp_size;
+    thread_rank = numba.cuda.threadIdx.x % warp_size
+    idx = numba.cuda.blockIdx.x * meta_group_size + meta_group_rank
+    N = B * T
+    if idx >= N:
+        return 
+    b, t = idx // T, idx % T
+    dout_bt = dout[b * T * C + t * C:] 
+    inp_bt = inp[b * T * C + t * C:] 
+    dinp_bt = dinp[b * T * C + t * C:] 
+    mean_bt = mean[b * T + t]
+    rstd_bt = rstd[b * T + t]
+
+    # first: two reduce operations
+    dnorm_mean = 0.0
+    dnorm_norm_mean = 0.0
+    for i in range(thread_rank, C, warp_size):
+        norm_bti = (inp_bt[i] - mean_bt) * rstd_bt
+        dnorm_i = weight[i] * dout_bt[i] 
+        dnorm_mean += dnorm_i
+        dnorm_norm_mean =+ dnorm_i * norm_bti
+
+    dnorm_mean = warp_sum(meta_group_rank, thread_rank, warp_size, dnorm_mean)
+    dnorm_norm_mean = warp_sum(meta_group_rank, thread_rank, warp_size, dnorm_norm_mean)
+
+    dnorm_mean = dnorm_mean / C
+    dnorm_norm_mean = dnorm_norm_mean / C
+    for i in range(thread_rank, C, warp_size):
+        norm_bti = (inp_bt[i] - mean_bt) * rstd_bt 
+        dnorm_i = weight[i] * dout_bt[i]
+        # gradient contribution to bias
+        numba.cuda.atomic.add(dbias, i, dout_bt[i])
+        # gradient contribution to weight
+        numba.cuda.atomic.add(dweight, i, norm_bti * dout_bt[i])
+        # gradient contribution to input
+        dval = 0.0
+        dval += dnorm_i  # term 1 
+        dval -= dnorm_mean  # term 2
+        dval -= norm_bti * dnorm_norm_mean  # term 3
+        dval *= rstd_bt  # final scale
+        dinp_bt[i] += dval 
+
+
+def layernorm_backward(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C):
+    block_size = 256
+    N = B * T
+    # one warp per token, so we need to divide by 32 here.
+    grid_size = ceil_div(N, block_size // 32)
+    layernorm_backward_kernel[grid_size, block_size](dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C)
+
+
+@numba.cuda.jit
+def gelu_backward_kernel(dinp, inp, dout, N):
+    i = numba.cuda.grid(1)
+    if (i < N):
+        scaling_factor = numba.cuda.libdevice.sqrtf(2.0 / math.pi)
+        x = inp[i]
+        cube =  0.044715 * x * x * x
+        tanh_arg = scaling_factor * (x + cube)
+        tanh_out = numba.cuda.libdevice.tanhf(tanh_arg)
+        coshf_out = numba.cuda.libdevice.coshf(tanh_arg)
+        sech_out = 1.0 / (coshf_out * coshf_out)
+        local_grad = 0.5 * (1.0 + tanh_out) + x * 0.5 * sech_out *scaling_factor * (1.0 + 3.0 * 0.044715 *x *x)
+        dinp[i] = local_grad * dout[i]
+
+
+def gelu_backward(dinp, inp, dout, N):
+    block_size = 128;
+    grid_size = ceil_div(N, block_size)
+    gelu_backward_kernel[grid_size, block_size](dinp, inp, dout, N)
+
+
+
+"""
+------------------------------------------------------------
+"""
 
 #TODO(ecastill) Use torch DataLoader instead?
 class DataLoader:
@@ -589,7 +706,14 @@ class GPT2Config:
         self.num_heads = None
         self.channels = None
 
-
+    def clone(self):
+        new = GPT2Config()
+        new.max_seq_len = self.max_seq_len
+        new.vocab_size = self.vocab_size
+        new.num_layers = self.num_layers
+        new.num_heads = self.num_heads
+        new.channels = self.channels
+        return new
 
 def malloc_and_point_parameters(params, param_sizes, num_parameters):
     # TODO(check): again, we are relying on cupy memory pool
@@ -706,6 +830,11 @@ class GPT2:
         self.acts = ActivationTensors()
         self.acts_memory = None
         self.act_sizes = [0 for i in range(NUM_ACTIVATION_TENSORS)]
+        self.grads = ParameterTensors()
+        self.grads_memory = None
+        self.grads_acts = ActivationTensors()
+        self.grads_acts_memory = None
+        self.num_parameters = 0
 
     def fill_in_parameter_sizes(self):
         V = self.config.vocab_size
@@ -903,10 +1032,139 @@ class GPT2:
             self.cpu_losses = cupy.asnumpy(acts.losses[:B * T])
             mean_loss = numpy.mean(self.cpu_losses)
             self.mean_loss = mean_loss;
-            print(mean_loss)
+            #print(mean_loss)
         else:
             pass
-        sys.exit(0)
+
+    def zero_grad(self):
+        if self.grads_memory is not None:
+            self.grads_acts_memory[:] = 0.0
+            self.grads_memory[:] = 0.0
+
+    def backward(self):
+        if self.mean_loss == -1.0:
+            raise RuntimeError("Error: must forward with targets before backward")
+
+        if self.grads_memory is None:
+            self.grads_memory = malloc_and_point_parameters(self.grads, self.params_sizes, self.num_parameters);
+            size_in_mb = int(round(self.num_parameters * cupy.dtype(cupy.float32).itemsize) / (1024*1024))
+            print(f"allocated {size_in_mb} MiB for parameter gradients")
+            # we're going to be clever for the activations backward pass. we don't need to exactly
+            # mirror the forward pass acrtivations and we will save memory.
+            bw_act_sizes = [0] * NUM_ACTIVATION_TENSORS
+            cfg = self.config.clone()
+            cfg.num_layers = 1; # copy the configuration but override number of layers to 1
+            fill_in_activation_sizes(bw_act_sizes, self.batch_size, self.seq_len, cfg);
+            # on top of that, some buffers are not needed at all, set their sizes to zero
+            bw_act_sizes[0] = 0  #  encoded
+            bw_act_sizes[2] = 0  #  ln1_mean
+            bw_act_sizes[3] = 0  #  ln1_rstd
+            bw_act_sizes[8] = 0  #  attproj
+            bw_act_sizes[9] = 0  #  residual2
+            bw_act_sizes[11] = 0  # ln2_mean
+            bw_act_sizes[12] = 0  # ln2_rstd
+            bw_act_sizes[18] = 0  # lnf_mean
+            bw_act_sizes[19] = 0  # lnf_rstd
+            bw_act_sizes[21] = 0  # probs
+            # count up and allocate the space
+            self.grads_acts_memory = malloc_and_point_activations(self.grads_acts, bw_act_sizes, self.num_activations);
+            self.num_grad_acts = 0;
+            for i in range(NUM_ACTIVATION_TENSORS):
+                self.num_grad_acts += bw_act_sizes[i];
+
+            size_in_mb = int(round(self.num_grad_acts * cupy.dtype(cupy.float32).itemsize) / (1024*1024))
+            print(f"allocated {size_in_mb} MiB for activation gradients")
+            # init gradients of parameters and activations to zero
+            self.zero_grad();
+
+            # convenience shortcuts
+            B = self.batch_size
+            T = self.seq_len
+            V = self.config.vocab_size
+            L = self.config.num_layers
+            NH = self.config.num_heads
+            C = self.config.channels
+        
+            # backward pass: go in the reverse order of the forward pass, and call backward() functions
+            params = self.params  # for brevity
+            grads = self.grads
+            acts = self.acts
+            grads_acts = self.grads_acts
+
+            # we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
+            # this was done in the fused classifier kernel as last step of forward pass
+            # technically that is a small, inline backward() pass of calculating
+            # total, final loss as the mean over all losses over all (B,T) positions in the batch
+            # next: backward the classifier matmul
+            matmul_backward(grads_acts.lnf, grads.wte, None, acts.logits, acts.lnf, params.wte, B, T, C, V)
+
+            residual = acts.residual3[(L-1) * B * T * C:]  # last residual is in residual3
+            dresidual = grads_acts.residual3  # the main buffer holding the gradient in the backward pass
+            layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C)
+            #print(dresidual[0], grads.lnfw[0], grads.lnfb[0])
+
+            # now backward all the layers
+            for l in range(L-1, -1, -1):
+                residual = acts.encoded if l == 0 else acts.residual3[(l-1) * B * T * C:]
+        
+                # get the pointers of the weights for this layer
+                l_ln1w = params.ln1w[l * C:]
+                l_qkvw = params.qkvw[l * 3*C * C:]
+                l_attprojw = params.attprojw [l * C * C:]
+                l_ln2w = params.ln2w[l * C:]
+                l_fcw = params.fcw[l * 4*C * C:]
+                l_fcprojw = params.fcprojw[l * C * 4*C:]
+                # get the pointers of the gradients of the weights for this layer
+                dl_ln1w = grads.ln1w[l * C:]
+                dl_ln1b = grads.ln1b[l * C:]
+                dl_qkvw = grads.qkvw[l * 3*C * C:]
+                dl_qkvb = grads.qkvb[l * 3*C:]
+                dl_attprojw = grads.attprojw[l * C * C:]
+                dl_attprojb = grads.attprojb[l * C:]
+                dl_ln2w = grads.ln2w[l * C:]
+                dl_ln2b = grads.ln2b[l * C:]
+                dl_fcw = grads.fcw[l * 4*C * C:]
+                dl_fcb = grads.fcb[l * 4*C:]
+                dl_fcprojw = grads.fcprojw[l * C * 4*C:]
+                dl_fcprojb = grads.fcprojb[l * C:]
+                # get the pointers of the activations for this layer
+                l_ln1 = acts.ln1[l * B * T * C:]
+                l_ln1_mean = acts.ln1_mean[l * B * T:]
+                l_ln1_rstd = acts.ln1_rstd[l * B * T:]
+                l_qkv = acts.qkv[l * B * T * 3*C:]
+                l_qkvr = acts.qkvr[l * B * T * 3*C:]
+                l_atty = acts.atty[l * B * T * C:]
+                l_att = acts.att[l * B * NH * T * T:]
+                l_residual2 = acts.residual2[l * B * T * C:]
+                l_ln2 = acts.ln2[l * B * T * C:]
+                l_ln2_mean = acts.ln2_mean[l * B * T:]
+                l_ln2_rstd = acts.ln2_rstd[l * B * T:]
+                l_fch = acts.fch[l * B * T * 4*C:]
+                l_fch_gelu = acts.fch_gelu[l * B * T * 4*C:]
+                # get the pointers of the gradients of the activations for this layer
+                # notice that there is no l *, because we just have a single copy, and keep
+                # re-using this memory in every Transformer block as we calculate backward pass
+                dl_ln1 = grads_acts.ln1
+                dl_qkv = grads_acts.qkv
+                dl_qkvr = grads_acts.qkvr
+                dl_atty = grads_acts.atty
+                dl_preatt = grads_acts.preatt
+                dl_att = grads_acts.att
+                dl_v_accum = grads_acts.v_accum
+                dl_ln2 = grads_acts.ln2
+                dl_fch = grads_acts.fch
+                dl_fch_gelu = grads_acts.fch_gelu
+                matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C)
+                #print(dl_fch_gelu[0], dl_fcprojw[0], dl_fcprojb[0], dresidual[0])
+                #print(dresidual[0], l_fch_gelu[0], l_fcprojw[0])
+                gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C)
+                print(dl_fch[0])
+                matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C)
+                # layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+                layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C)
+                matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C)
+                print(dl_atty[0], dl_attprojw[0], dl_attprojb[0])
+                sys.exit()
 
 def main():
     global cublaslt_workspace_size
@@ -991,12 +1249,19 @@ def main():
             for i in range(val_num_batches):
                 val_loader.next_batch()
                 model.forward(val_loader.inputs(), val_loader.targets(), B, T)
-                sys.exit(0)
-                #val_loss += model.mean_loss
+                val_loss += model.mean_loss
             val_loss /= val_num_batches;
             print(f"val loss {val_loss}");
             #logger_log_val(&logger, step, val_loss);
 
+        if last_step:
+            break
+
+        train_loader.next_batch()
+        model.forward(train_loader.inputs(), train_loader.targets(), B, T)
+        model.zero_grad()
+        model.backward()
+        break
 
 if __name__ == "__main__":
     main()
