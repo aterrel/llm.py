@@ -49,7 +49,7 @@ def checkCudaErrors(result):
 # TODO use the cuda.cooperative.experimental.warp.sum API instead
 @numba.cuda.jit(device=True)
 def warp_sum(meta_group_rank, thread_rank, warp_size, sum):
-    sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
+    sums = numba.cuda.shared.array(shape=1024, dtype=numba.float32)
     sums[numba.cuda.threadIdx.x] = sum
     numba.cuda.syncthreads()
     if (thread_rank == 0):
@@ -60,16 +60,16 @@ def warp_sum(meta_group_rank, thread_rank, warp_size, sum):
     return sums[meta_group_rank * warp_size]
 
 @numba.cuda.jit(device=True)
-def warp_max(meta_group_rank, thread_rank, warp_size, sum):
-    sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
-    sums[numba.cuda.threadIdx.x] = sum
+def warp_max(meta_group_rank, thread_rank, warp_size, val):
+    vals = numba.cuda.shared.array(shape=1024, dtype=numba.float32)
+    vals[numba.cuda.threadIdx.x] = val
     numba.cuda.syncthreads()
     if (thread_rank == 0):
         for i in range(meta_group_rank * warp_size + 1, meta_group_rank * warp_size + warp_size):
-            sums[meta_group_rank * warp_size] =  numba.cuda.libdevice.fmaxf(sums[meta_group_rank * warp_size], sums[i])
+            vals[meta_group_rank * warp_size] =  numba.cuda.libdevice.fmaxf(vals[meta_group_rank * warp_size], vals[i])
     numba.cuda.syncthreads()
     # divide the whole row by the sum
-    return sums[meta_group_rank * warp_size]
+    return vals[meta_group_rank * warp_size]
 
 
 @numba.cuda.jit
@@ -122,6 +122,13 @@ def layernorm_forward(out, mean,  rstd, inp, weight, bias, B, T, C):
     N = B * T
     grid_size = ceil_div(N * 32, block_size)
     layernorm_forward_kernel3[grid_size, block_size](out, mean, rstd, inp, weight, bias, N, C)
+
+
+def matmul_forward_cublas(out, inp, weight, bias, B, T, C, OC):
+    assert(bias == None)  # bias is not supported for this kernel
+    alpha = numpy.array(1.0, dtype=numpy.float32)
+    beta = numpy.array(0.0, dtype=numpy.float32)
+    cublas.sgemm(cublas_handle, cublas.Operation.T, cublas.Operation.N, OC, B*T, C, alpha.ctypes.data, weight.data.ptr, C, inp.data.ptr, C, beta.ctypes.data, out.data.ptr, OC)
 
 
 def cublaslt_setattr(matmul_desc, name, value):
@@ -223,7 +230,7 @@ def softmax_forward_kernel5(out, inv_temperature, inp, N, T):
     maxval = -3.402823e+38  # FLT_MAX
     sumval = 0.0
     for i in range(thread_rank , pos_by_4, warp_size):
-        v = x[i:i+4]
+        v = x[i*4:i*4+4]
         old_maxval = maxval
         for k in range(4):
             maxval = numba.cuda.libdevice.fmaxf(maxval, v[k])
@@ -370,6 +377,84 @@ def gelu_forward(out, inp, N):
     blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
     gelu_forward_kernel[blocks_per_grid, threads_per_block](out, inp, N)
 
+@numba.cuda.jit(device=True)
+def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
+    x = inp[idx * P:]
+    thread_maxval = -math.inf
+    thread_sumval = 0.0
+
+    # do the loop in reverse to maximise probability of L2 cache hits
+    # so even small L2s get some hits on the 2nd read of the same thread
+    for i in range(V + numba.cuda.threadIdx.x - numba.cuda.blockDim.x, -1, -numba.cuda.blockDim.x):
+        v = x[i]
+        old_maxval = thread_maxval
+        thread_maxval = numba.cuda.libdevice.fmaxf(thread_maxval, v)
+        thread_sumval *= numba.cuda.libdevice.expf(old_maxval - thread_maxval)
+        thread_sumval += numba.cuda.libdevice.expf(v - thread_maxval)
+
+    # two reductions of up to 1024 threads:
+    # 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
+    # this results in much cleaner assembly than a multi-warp cg::reduce
+    shared_maxval = numba.cuda.shared.array(shape=32, dtype=numba.float32)
+    shared_sumval = numba.cuda.shared.array(shape=32, dtype=numba.float32)
+    num_warps = numba.cuda.blockDim.x // 32
+    warp_id = numba.cuda.threadIdx.x // 32
+    lane_id = numba.cuda.threadIdx.x % 32
+
+    # reduce maxval within each warp
+    warp_maxval = warp_max(warp_id, lane_id, 32, thread_maxval)
+    # thread 0 in each warp writes to shared memory
+    if lane_id == 0:
+        shared_maxval[warp_id] = warp_maxval
+    numba.cuda.syncthreads()
+
+    # each thread now loads the maxval across previous warps
+    # if the thread is "out of range" of data, use -FLT_MAX as the maxval
+    warp_maxval = shared_maxval[lane_id] if (lane_id < num_warps) else -3.402823e+38  # FLT_MAX     
+    block_maxval = warp_max(warp_id, lane_id, 32, warp_maxval)
+    # each thread uses maxval to scale sumval to avoid numerical instability / overflow
+    thread_sumval *= numba.cuda.libdevice.expf(thread_maxval - block_maxval)
+    # (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
+    warp_sumval = warp_sum(warp_id, lane_id, 32, thread_sumval)
+    if lane_id == 0:
+        shared_sumval[warp_id] = warp_sumval
+    numba.cuda.syncthreads()
+    # same strategy, now reduce sumval across warps
+    warp_sumval = shared_sumval[lane_id] if (lane_id < num_warps) else 0.0
+    block_sumval = warp_sum(warp_id, lane_id, 32, warp_sumval)
+    return (1.0 / block_sumval, block_maxval)
+
+
+@numba.cuda.jit
+def fused_classifier_kernel3(logits, losses, targets, B, T, V, P):
+    idx = numba.cuda.blockIdx.x
+    ix = targets[idx]
+    # softmax (reading B * T * V, same logits read again below, hopefully still in cache)
+    scale, offset = prepare_softmax_blockwide_nofloat4(idx, logits, V, P)
+    # calculate the probability needed for the loss and update (single-threaded)
+    if numba.cuda.threadIdx.x == 0:
+        prob = numba.cuda.libdevice.expf(logits[idx * P + ix] - offset) * scale;
+        losses[idx] = -numba.cuda.libdevice.logf(prob);
+    # very sensible default for dlosses is 1/(B*T), which is the uniform loss
+    dloss = 1.0 / (B * T)
+    # calculate the gradients directly, saves bandwidth from probs during training
+    # but also supports writing probs for inference-only and debugging
+    logits_vec = logits[idx * P:]
+    for i in range(numba.cuda.threadIdx.x, V, numba.cuda.blockDim.x):
+        # this is the 2nd read of logits after the one in prepare_softmax2
+        # this data will never be needed again, so we reduce cache persistence
+        v = logits_vec[i]
+        prob = numba.cuda.libdevice.expf(v - offset) * scale
+        indicator = 1.0 if i == ix else 0.0
+        logits[idx * P + i] = (prob - indicator) * dloss
+
+
+# replaces logits with logit gradients
+def fused_classifier3(logits, losses, targets, B, T, V, P):
+    block_size = 1024;
+    N = B * T;
+    grid_size = N;
+    fused_classifier_kernel3[grid_size, block_size](logits, losses, targets, B, T, V, P)
 
 """
 ---------------------------------------------------
@@ -733,6 +818,7 @@ class GPT2:
             # self.inputs = cupy.empty((B * T), dtype=cupy.int32);
             # self.target = cupy.empty((B * T), dtype=cupy.int32);
             # self.cpu_losses = cupy.empty((B * T), dtype=cupy.float32);
+            self.cpu_losses = cupyx.empty_pinned(B * T, dtype=cupy.float32)
         else:
             # validate B,T is consistent with how we've allocated the memory before
             # in principle we could get more clever here in the future, for now this is safest
@@ -787,30 +873,39 @@ class GPT2:
             # need not be stored for backward
             l_preatt = acts.preatt
             l_v_accum = acts.v_accum
-            i=0
-            print(l,'input', acts.encoded[i], ' ', acts.encoded[i+1])
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
-            print(l,'layernorm', l_ln1[i], ' ', l_ln1[i+1])
+            #print('layernorm', l_ln1[0], l_ln1[20 * 50257 + 461])
             matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C)
-            print(l,'matmul', l_qkv[i], ' ', l_qkv[i+1])
+            #print('matmul', l_qkv[0], l_qkv[20 * 50257 + 461])
             attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH)
-            print(l,'att', l_atty[i], ' ', l_atty[i+1])
+            #print('att', l_atty[0], l_atty[20 * 50257 + 461])
             matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C)
-            print(l,'matmul2', l_attproj[i], ' ', l_attproj[i+1])
+            #print('matmul', l_attproj[0], l_attproj[20 * 50257 + 461])
             residual_forward(l_residual2, residual, l_attproj, B*T*C)
-            print(l,'resi', l_residual2[i], ' ', l_residual2[i+1])
+            #print('resi', l_residual2[0], l_residual2[20 * 50257 + 461])
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C)
-            print(l,'layernorm2', l_ln2[i], ' ', l_ln2[i+1])
+            #print('layernorm', l_ln2[0], l_ln2[20 * 50257 + 461])
             matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C)
-            print(l,'matmul3', l_fch[i], ' ', l_fch[i+1])
+            #print('matmul', l_fch[0], l_fch[20 * 50257 + 461])
             gelu_forward(l_fch_gelu, l_fch, B*T*4*C)
-            print(l,'gelu', l_fch_gelu[i], ' ', l_fch_gelu[i+1])
+            #print('matmul', l_fch_gelu[0], l_fch_gelu[20 * 50257 + 461])
             matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C)
-            print(l,'matmul4', l_fcproj[i], ' ', l_fcproj[i+1])
+            #print('matmul', l_fcproj[0], l_fcproj[20 * 50257 + 461])
             residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C)
-            print(l,'residual', l_residual3[i], ' ', l_residual3[i+1])
+            #print('resi', l_residual3[0], l_residual3[20 * 50257 + 461])
+            #print(l)
 
         residual = acts.residual3[(L-1) * B * T * C:] # last residual is in residual3
+        layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C)
+        matmul_forward_cublas(acts.logits, acts.lnf, params.wte, None, B, T, C, V)
+        if targets is not None:
+            fused_classifier3(acts.logits, acts.losses, self.targets.ravel(), B, T, V, V)
+            self.cpu_losses = cupy.asnumpy(acts.losses[:B * T])
+            mean_loss = numpy.mean(self.cpu_losses)
+            self.mean_loss = mean_loss;
+            print(mean_loss)
+        else:
+            pass
         sys.exit(0)
 
 def main():
