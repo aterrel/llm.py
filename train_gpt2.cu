@@ -47,10 +47,37 @@ the layernorms are connected to the residuals so we += in layernorm backward.
 #include <cuda/std/mdspan>
 #include <cuda/atomic>
 
+#include <iostream>
+#include <fstream>
+
+
 template <class T>
 using pinned_vector = thrust::host_vector<
     T, thrust::mr::stateless_resource_allocator<
            T, thrust::system::cuda::universal_host_pinned_memory_resource>>;
+
+void dump_tensor(float* ddata, const std::string& filename, std::size_t size) {
+    // Open a binary file for writing
+    thrust::host_vector<float> data(size);
+    thrust::copy_n(thrust::device_pointer_cast(ddata), size, data.begin());
+
+    std::ofstream outFile("outs/" + filename, std::ios::binary);
+    if (!outFile) {
+        std::cerr << "Error: Could not open the file for writing!" << std::endl;
+        return;
+    }
+
+    // Write the vector data to the binary file
+    outFile.write(reinterpret_cast<const char*>(data.data()), size * sizeof(float));
+
+    // Close the file
+    outFile.close();
+    if (!outFile.good()) {
+        std::cerr << "Error: Could not write to the file correctly!" << std::endl;
+    }
+}
+
+
 
 // ----------------------------------------------------------------------------
 // CUDA utils
@@ -195,6 +222,9 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    //if (blockIdx.x == 0) {
+    //    printf("%d %d %d %d %d\n", threadIdx.x, warp.meta_group_size(), warp.meta_group_rank(), warp.thread_rank(),  warp.size());
+    //} 
     if(idx >= N) {
         return;
     }
@@ -608,6 +638,9 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
     // go through blocks in reverse order, so the slowest block starts first
     int t0 = T - 1 - T_per_block*blockIdx.x;
 
+    //if (blockIdx.x == 3 && blockIdx.y == 4) {
+    //    printf("%d %d %d %d %d %d %d\n",threadIdx.x, blockDim.x,blockDim.y, warp.meta_group_size(), warp.meta_group_rank(), warp.thread_rank(), block.thread_rank());
+    //}
     att += idx * T * T;
     datt += idx * T * T;
     dpreatt += idx * T * T;
@@ -626,12 +659,14 @@ __global__ void softmax_autoregressive_backward_kernel(float* dpreatt, const flo
         float local_sum = 0;
         for (int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
             local_sum += att_bth[t2] * datt_bth[t2];
+            //if (blockIdx.x == 0 && blockIdx.y ==0 && threadIdx.x == 0) printf("%d %f %f %f\n", idx * T * T + t*T + t2, local_sum, att_bth[t2], datt_bth[t2]); 
         }
 
+        //if (blockIdx.x == 0 && blockIdx.y ==0 && warp.meta_group_rank() == 0) printf("%d local sum %f\n", threadIdx.x, local_sum);
         block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
         block.sync();
+        //if (blockIdx.x == 0 && blockIdx.y ==0 && threadIdx.x == 0) printf("local sum %f\n", block_acc[warp.thread_rank()]);
         local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
-
         for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
             // don't touch the cache. Some parts will still be here from the previous loop, and
             // we want to exploit those.
@@ -815,6 +850,7 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     const int N = B * T;
     const int grid_size = CEIL_DIV(N * 32, block_size);
     layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+cudaDeviceSynchronize();
     cudaCheck(cudaGetLastError());
 }
 
@@ -953,16 +989,15 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
-
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
     cudaCheck(cudaGetLastError());
-
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T, &alpha, v, HS, T * HS, att, T, T * T, &beta, vaccum, HS, T * HS, B * NH));
+
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -1390,11 +1425,12 @@ void gpt2_forward(GPT2 &model, int* inputs, int* targets, int B, int T) {
     ActivationTensors acts = model.acts;
     float* residual;
     encoder_forward(acts.encoded, model.inputs, params.wte, params.wpe, B, T, C, V); // encoding goes into residual[0]
+    dump_tensor(acts.encoded, "acts.encoded", B * T * C);
+
 
     for (int l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
-
         // get the pointers of the weights for this layer
         float* l_ln1w = params.ln1w + l * C;
         float* l_ln1b = params.ln1b + l * C;
@@ -1433,10 +1469,21 @@ void gpt2_forward(GPT2 &model, int* inputs, int* targets, int B, int T) {
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+    dump_tensor(l_ln1, std::to_string(l)+"_l_ln1", B * T * C);
+    dump_tensor(l_ln1_mean, std::to_string(l)+"_l_ln1_mean", B * T);
+    dump_tensor(l_ln1_rstd, std::to_string(l)+"_l_ln1_rstd", B * T);
         matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+    dump_tensor(l_qkv, std::to_string(l)+"_l_qkv", B * T * 3 * C);
         attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH);
+    dump_tensor(l_atty, std::to_string(l)+"_l_atty", B * T * C);
+    dump_tensor(l_v_accum, std::to_string(l)+"_l_v_accum", B * T * C);
+    dump_tensor(l_qkvr, std::to_string(l)+"_l_qkvr", B * T * 3 * C);
+    dump_tensor(l_preatt, std::to_string(l)+"_l_preatt", B * NH * T * T);
+    dump_tensor(l_att, std::to_string(l)+"_l_att", B * NH * T * T);
         matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+    dump_tensor(l_attproj, std::to_string(l)+"_l_attproj", B * T * C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
+    dump_tensor(l_residual2, std::to_string(l)+"_l_residual2", B * T * C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
         matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
@@ -1461,7 +1508,6 @@ void gpt2_forward(GPT2 &model, int* inputs, int* targets, int B, int T) {
         for (int i=0; i<B*T; i++) { mean_loss += model.cpu_losses[i]; }
         mean_loss /= B*T;
         model.mean_loss = mean_loss;
-
     } else {
         // if we don't have targets, we don't have loss
         softmax_forward(acts.probs, acts.logits, B*T, V);
@@ -1535,11 +1581,14 @@ void gpt2_backward(GPT2 &model) {
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
     matmul_backward(grads_acts.lnf, grads.wte, NULL, acts.logits, acts.lnf, params.wte, B, T, C, V);
+    //dump_tensor(grads_acts.lnf, "grad_acts.lnf", B * T * C);
+    //dump_tensor(grads.wte, "grads.wte", V * C);
+    //dump_tensor(acts.lnf, "acts.lnf", B * T * C);
+    //dump_tensor(params.wte, "params.wte", V * C);
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
-
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -1983,7 +2032,7 @@ int main(int argc, char *argv[]) {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % sample_every == 0 || last_step) {
+        /*if (step > 0 && step % sample_every == 0 || last_step) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = GPT2_EOT;
@@ -2017,7 +2066,7 @@ int main(int argc, char *argv[]) {
                 fflush(stdout);
             }
             printf("\n---\n");
-        }
+        }*/
 
         // bit confusing: we want to make sure to eval and sample on 0th iteration
         // but also after the very last iteration. so we loop for step <= train_num_batches
