@@ -74,14 +74,14 @@ cx_warp_files += cx_warp_max.files
 
 # TODO use the cuda.cooperative.experimental.warp.sum API instead
 @numba.cuda.jit(device=True, fastmath=True)
-def warp_sum(meta_group_rank, thread_rank, warp_size, sum):
+def warp_sum(sum):
     temp_storage = numba.cuda.shared.array(shape=sum_storage_bytes, dtype=numba.uint8)
     warp_output = cx_warp_sum(temp_storage, sum)
     return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
 
 
 @numba.cuda.jit(device=True, fastmath=True)
-def warp_max(meta_group_rank, thread_rank, warp_size, val):
+def warp_max(val):
     temp_storage = numba.cuda.shared.array(shape=max_storage_bytes, dtype=numba.uint8)
     warp_output = cx_warp_max(temp_storage, val)
     return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
@@ -107,7 +107,7 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     for i in range(thread_rank, C, warp_size):
         sum += x[i]
 
-    m = warp_sum(meta_group_rank, thread_rank, warp_size, sum) / C
+    m = warp_sum(sum) / C
     if (thread_rank == 0):
         mean[idx] = m
 
@@ -117,7 +117,7 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
         diff = x[i] - m
         sum += diff * diff
 
-    s = warp_sum(meta_group_rank, thread_rank, warp_size, sum)
+    s = warp_sum(sum)
     s = numba.cuda.libdevice.rsqrt(s / C + 1e-5)
 
     if (thread_rank == 0):
@@ -266,11 +266,11 @@ def softmax_forward_kernel5(out, inv_temperature, inp, N, T):
         sumval *= numba.cuda.libdevice.expf(inv_temperature * (old_maxval - maxval))
         sumval += numba.cuda.libdevice.expf(inv_temperature * (x[4*pos_by_4 + thread_rank] - maxval))
 
-    global_maxval = warp_max(meta_group_rank, thread_rank, warp_size, maxval)
+    global_maxval = warp_max(maxval)
     sumval *= numba.cuda.libdevice.expf(inv_temperature * (maxval - global_maxval))
 
     # reduce sumval
-    sum = warp_sum(meta_group_rank, thread_rank, warp_size, sumval)
+    sum = warp_sum(sumval)
     # divide the whole row by the sum
     norm = 1.0 / sum
 
@@ -425,7 +425,7 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
     lane_id = numba.cuda.threadIdx.x % 32
 
     # reduce maxval within each warp
-    warp_maxval = warp_max(warp_id, lane_id, 32, thread_maxval)
+    warp_maxval = warp_max(thread_maxval)
     # thread 0 in each warp writes to shared memory
     if lane_id == 0:
         shared_maxval[warp_id] = warp_maxval
@@ -434,17 +434,17 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
     # each thread now loads the maxval across previous warps
     # if the thread is "out of range" of data, use -FLT_MAX as the maxval
     warp_maxval = shared_maxval[lane_id] if (lane_id < num_warps) else -3.402823e+38  # FLT_MAX     
-    block_maxval = warp_max(warp_id, lane_id, 32, warp_maxval)
+    block_maxval = warp_max(warp_maxval)
     # each thread uses maxval to scale sumval to avoid numerical instability / overflow
     thread_sumval *= numba.cuda.libdevice.expf(thread_maxval - block_maxval)
     # (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
-    warp_sumval = warp_sum(warp_id, lane_id, 32, thread_sumval)
+    warp_sumval = warp_sum(thread_sumval)
     if lane_id == 0:
         shared_sumval[warp_id] = warp_sumval
     numba.cuda.syncthreads()
     # same strategy, now reduce sumval across warps
     warp_sumval = shared_sumval[lane_id] if (lane_id < num_warps) else 0.0
-    block_sumval = warp_sum(warp_id, lane_id, 32, warp_sumval)
+    block_sumval = warp_sum(warp_sumval)
     return (1.0 / block_sumval, block_maxval)
 
 
@@ -503,7 +503,7 @@ def matmul_backward_bias_kernel2(dbias, dout, B, T, OC):
     for i in range(thread_rank , BT, warp_size):
         sum += dout[i * OC + idx]
     # now do a warp-level reduce to get the sum across the 32 threads in this warp
-    sum = warp_sum(meta_group_rank, thread_rank, warp_size, sum)
+    sum = warp_sum(sum)
     # write the result to output (global memory)
     if thread_rank == 0:
         dbias[idx] += sum
@@ -550,8 +550,8 @@ def layernorm_backward_kernel(dinp, dweight, dbias, dout, inp, weight, mean, rst
         dnorm_mean += dnorm_i
         dnorm_norm_mean =+ dnorm_i * norm_bti
 
-    dnorm_mean = warp_sum(meta_group_rank, thread_rank, warp_size, dnorm_mean)
-    dnorm_norm_mean = warp_sum(meta_group_rank, thread_rank, warp_size, dnorm_norm_mean)
+    dnorm_mean = warp_sum(dnorm_mean)
+    dnorm_norm_mean = warp_sum(dnorm_norm_mean)
 
     dnorm_mean = dnorm_mean / C
     dnorm_norm_mean = dnorm_norm_mean / C
@@ -650,9 +650,9 @@ def softmax_autoregressive_backward_kernel(dpreatt, datt, att, B, T, C, scale):
            #if numba.cuda.blockIdx.x == 0 and numba.cuda.blockIdx.y == 0 and numba.cuda.threadIdx.x == 0:
            #    print(t2 + t *T + idx * T * T, local_sum, att_bth[t2], datt_bth[t2])
 
-       block_acc[meta_group_rank] = warp_sum(meta_group_rank, thread_rank, warp_size, local_sum) 
+       block_acc[meta_group_rank] = warp_sum(local_sum) 
        numba.cuda.syncthreads()
-       local_sum = warp_sum(meta_group_rank, thread_rank, warp_size, block_acc[thread_rank]) 
+       local_sum = warp_sum(block_acc[thread_rank]) 
        for t3 in range(numba.cuda.threadIdx.x, t + 1, BlockSize):
             acc = att_bth[t3] * (datt_bth[t3] - local_sum)
             dpreatt_bth[t3] = scale * acc
