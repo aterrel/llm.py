@@ -23,10 +23,6 @@ cublas_compute_type = None
 cublas_handle = None
 cublaslt_handle = None
 
-def print4(data):
-    print(data[0], data[256], data[512])
-
-
 def _cudaGetErrorEnum(error):
     if isinstance(error, cuda.CUresult):
         err, name = cuda.cuGetErrorName(error)
@@ -53,41 +49,64 @@ def checkCudaErrors(result):
 --------------------- FORWARD KERNELS ---------------------
 """
 
-def compare_tensor(cupy_val, name, size):
-    if False:
+def compare_tensor(cupy_val, name, size, dtype=numpy.float32):
+    if True:
         numpy_array = cupy.asnumpy(cupy_val[:size])
-        file_data = numpy.fromfile(f"outs/{name}", dtype=numpy.float32)
+        file_data = numpy.fromfile(f"outs/{name}", dtype=dtype)
         print("Checking ", name)
-        numpy.testing.assert_allclose(file_data, numpy_array, rtol=1e-04, atol=1e-05)
+        #numpy.testing.assert_allclose(file_data, numpy_array, atol=1e-6)#, rtol=1e-01, atol=1e-01)
+        numpy.testing.assert_allclose(file_data, numpy_array)
+
+def replace_tensor(cupy_val, name, size, dtype=numpy.float32):
+    if True:
+        numpy_array = cupy.asnumpy(cupy_val[:size])
+        file_data = numpy.fromfile(f"outs/{name}", dtype=dtype)
+        print("Replacing ", name)
+        cupy_val[:size] = cupy.array(file_data)
 
 patch.patch_numba_linker(lto=True)        
-cx_warp_sum = cudax.warp.sum(numba.float32)
+cx_warp_sum = cudax.warp.sum(numba.float64)
 sum_storage_bytes = cx_warp_sum.temp_storage_bytes
 cx_warp_files = cx_warp_sum.files
 
 def max_op(a, b):
     return a if a > b else b
 
-cx_warp_max = cudax.warp.reduce(numba.float32, max_op)
+cx_warp_max = cudax.warp.reduce(numba.float64, max_op)
 max_storage_bytes = cx_warp_max.temp_storage_bytes
 cx_warp_files += cx_warp_max.files
 
+
 # TODO use the cuda.cooperative.experimental.warp.sum API instead
 @numba.cuda.jit(device=True, fastmath=True)
-def warp_sum(sum):
-    temp_storage = numba.cuda.shared.array(shape=sum_storage_bytes, dtype=numba.uint8)
-    warp_output = cx_warp_sum(temp_storage, sum)
-    return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
-
+def warp_sum(meta_group_rank, thread_rank, warp_size, sum):
+    #sum_fp64 = numpy.float64(sum)
+    #temp_storage = numba.cuda.shared.array(shape=sum_storage_bytes, dtype=numba.uint8)
+    #warp_output = cx_warp_sum(temp_storage, sum_fp64)
+    #return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
+    sums = numba.cuda.shared.array(shape=4096, dtype=numpy.float32)
+    offset = 16
+    sum = numpy.float32(sum)
+    while offset > 0:
+       #if numba.cuda.blockIdx.x == 0 and meta_group_rank == 0:
+       #    print(thread_rank, sum)
+       sum += numba.cuda.shfl_down_sync(0xffffffff, sum, offset);
+       offset = offset//2
+    numba.cuda.syncthreads()
+    if thread_rank == 0:
+       sums[meta_group_rank * 32] = sum
+    numba.cuda.syncthreads()
+    return sums[meta_group_rank * 32]
 
 @numba.cuda.jit(device=True, fastmath=True)
 def warp_max(val):
+    val_fp64 = numpy.float64(val)
     temp_storage = numba.cuda.shared.array(shape=max_storage_bytes, dtype=numba.uint8)
-    warp_output = cx_warp_max(temp_storage, val)
+    warp_output = cx_warp_max(temp_storage, val_fp64)
     return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
 
-
-@numba.cuda.jit(fastmath=True, link=cx_warp_files)
+fp32 =numpy.float32
+@numba.cuda.jit('void(float32[:], float32[:], float32[:],float32[:], float32[:], float32[:], int32, int32)', fastmath=True, link=cx_warp_files)
 def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     # This emulates the warp cg which is not available in numba
     warp_size = 32
@@ -98,27 +117,26 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     # Ensure the thread is within the bounds of the array
     if idx >= N:
         return
-    # Space so all the threads can share partial data
-    sums = numba.cuda.shared.array(shape=512, dtype=numba.float32)
 
     #mean
-    sum = 0
+    sum = fp32(0.0)
     x = inp[idx * C:]
     for i in range(thread_rank, C, warp_size):
         sum += x[i]
 
-    m = warp_sum(sum) / C
+    m = warp_sum(meta_group_rank, thread_rank, warp_size, sum) / fp32(C)
+    #m = numpy.float32(sum / C)
     if (thread_rank == 0):
         mean[idx] = m
 
     # rstd
-    sum = 0
+    sum = fp32(0.0)
     for i in range(thread_rank, C, warp_size):
-        diff = x[i] - m
+        diff = (x[i] - m)
         sum += diff * diff
 
-    s = warp_sum(sum)
-    s = numba.cuda.libdevice.rsqrt(s / C + 1e-5)
+    s = warp_sum(meta_group_rank, thread_rank, warp_size, sum)
+    s = numba.cuda.libdevice.rsqrtf(s / fp32(C) + 1e-5)
 
     if (thread_rank == 0):
         rstd[idx] = s
@@ -126,8 +144,9 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     # final normalization and scaling by weight/bias
     o = out[idx * C:]
     for c in range(thread_rank, C, warp_size):
-        n = s  * (x[c] - m)
+        n = s * (x[c] - m)
         o[c] = n * weight[c] + bias[c]
+
 
 def ceil_div(a, b):
     return -(a // -b)
@@ -176,12 +195,13 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     if bias.data.ptr % 16 != 0:
         raise RuntimeError("Bias pointer is not aligned (cuBLASLt requirement)!\n")
     #options = nvmath.linalg.advanced.MatmulOptions(compute_type=nvmath.linalg.advanced.MatmulComputeType.COMPUTE_32F)
-    #weight = weight[:C*OC].reshape((OC, C))
-    #inp = inp[:B*T*C].reshape((C,B*T))
-    #print(weight.shape, inp.shape)
+    #weight = weight[:C*OC].reshape((OC, C), order='F')
+    #inp = inp[:B*T*C].reshape((C,B*T), order='F')
     #if has_bias:
     #    bias = bias[:OC].reshape((OC,))
-    #nvmath.linalg.advanced.Matmul(weight, inp, c=bias, alpha=1.0, beta=0.0, options=options)
+    #mout = nvmath.linalg.advanced.matmul(weight, inp, c=bias, alpha=1.0, beta=0.0, options=options)
+    #out[:B*T*3*C] = mout.ravel()
+    #return
     returnedResults = 0
     # create the operation descriptor
     opNoTranspose = cublas.Operation.N
@@ -230,7 +250,6 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     cublaslt.matrix_layout_destroy(bias_layout)
 
 
-
 @numba.cuda.jit(fastmath=True, link=cx_warp_files)
 def softmax_forward_kernel5(out, inv_temperature, inp, N, T):
     # inp, out shape: (N, T, T), where N = B * NH
@@ -245,7 +264,7 @@ def softmax_forward_kernel5(out, inv_temperature, inp, N, T):
     meta_group_rank = numba.cuda.threadIdx.x // warp_size;
     thread_rank = numba.cuda.threadIdx.x % warp_size
     idx = (numba.cuda.gridDim.x - numba.cuda.blockIdx.x -1) * meta_group_size + meta_group_rank  # backward order
-    if idx >= N * T:
+    if idx >= (N * T):
         return
     own_pos = idx % T
     pos_by_4 = own_pos // 4
@@ -270,7 +289,7 @@ def softmax_forward_kernel5(out, inv_temperature, inp, N, T):
     sumval *= numba.cuda.libdevice.expf(inv_temperature * (maxval - global_maxval))
 
     # reduce sumval
-    sum = warp_sum(sumval)
+    sum = warp_sum(meta_group_rank, thread_rank, warp_size, sumval)
     # divide the whole row by the sum
     norm = 1.0 / sum
 
@@ -322,7 +341,7 @@ def scatter(out, vaccum, NH, T, HS, size):
     scatter_kernel[blocks_per_grid, threads_per_block](out, vaccum, NH, T, HS, size)
   
 
-def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
+def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, l):
     block_size = 256
     softmax_block_size = 256
     HS = C // NH  # head size
@@ -335,18 +354,24 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
     size = B * NH * T * HS
     # Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]  
     qkv_inp(q, k, v, inp_md, NH, T, HS, size)
-
+    #compare_tensor(q, f'{l}_q', B * NH * T * HS)
+    #compare_tensor(k, f'{l}_k', B * NH * T * HS)
+    #compare_tensor(v, f'{l}_v', B * NH * T * HS)
     # batched matrix multiply using cuBLAS
     alpha = numpy.array(1.0, dtype=numpy.float32)
     beta = numpy.array(0.0, dtype=numpy.float32)
     cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.T, cublas.Operation.N, T, T, HS, alpha.ctypes.data, k.data.ptr, HS, T * HS, q.data.ptr, HS, T*HS, beta.ctypes.data, preatt.data.ptr, T, T*T, B*NH)
 
+    #compare_tensor(preatt, f'{l}_preatt', B * NH * T * T)
     scale = 1.0 / math.sqrt(HS);
     grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5[grid_size, softmax_block_size](att, scale, preatt, B * NH, T)
+    #compare_tensor(att, f'{l}_att', B * NH * T * T)
+    #replace_tensor(att, f'{l}_att', B * NH * T * T)
     # new approach: first cuBLAS another batched matmul
     # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.N, cublas.Operation.N, HS, T, T, alpha.ctypes.data, v.data.ptr, HS, T * HS, att.data.ptr, T, T*T, beta.ctypes.data, vaccum.data.ptr, HS, T*HS, B*NH)
+    #compare_tensor(vaccum, f'{l}_vaccum', B * T * C)
       
     # now unpermute
     # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -406,6 +431,11 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
     thread_maxval = -math.inf
     thread_sumval = 0.0
 
+    warp_size = 32
+    meta_group_size = numba.cuda.blockDim.x // warp_size;
+    meta_group_rank = numba.cuda.threadIdx.x // warp_size;
+    thread_rank = numba.cuda.threadIdx.x % warp_size
+
     # do the loop in reverse to maximise probability of L2 cache hits
     # so even small L2s get some hits on the 2nd read of the same thread
     for i in range(V + numba.cuda.threadIdx.x - numba.cuda.blockDim.x, -1, -numba.cuda.blockDim.x):
@@ -438,13 +468,13 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
     # each thread uses maxval to scale sumval to avoid numerical instability / overflow
     thread_sumval *= numba.cuda.libdevice.expf(thread_maxval - block_maxval)
     # (warp-level) reduce sumval, thread 0 in each warp saves result in shared memory
-    warp_sumval = warp_sum(thread_sumval)
+    warp_sumval = warp_sum(meta_group_rank, thread_rank, warp_size, thread_sumval)
     if lane_id == 0:
         shared_sumval[warp_id] = warp_sumval
     numba.cuda.syncthreads()
     # same strategy, now reduce sumval across warps
     warp_sumval = shared_sumval[lane_id] if (lane_id < num_warps) else 0.0
-    block_sumval = warp_sum(warp_sumval)
+    block_sumval = warp_sum(meta_group_rank, thread_rank, warp_size, warp_sumval)
     return (1.0 / block_sumval, block_maxval)
 
 
@@ -503,7 +533,7 @@ def matmul_backward_bias_kernel2(dbias, dout, B, T, OC):
     for i in range(thread_rank , BT, warp_size):
         sum += dout[i * OC + idx]
     # now do a warp-level reduce to get the sum across the 32 threads in this warp
-    sum = warp_sum(sum)
+    sum = warp_sum(meta_group_rank, thread_rank, warp_size, sum)
     # write the result to output (global memory)
     if thread_rank == 0:
         dbias[idx] += sum
@@ -550,11 +580,11 @@ def layernorm_backward_kernel(dinp, dweight, dbias, dout, inp, weight, mean, rst
         dnorm_mean += dnorm_i
         dnorm_norm_mean =+ dnorm_i * norm_bti
 
-    dnorm_mean = warp_sum(dnorm_mean)
-    dnorm_norm_mean = warp_sum(dnorm_norm_mean)
+    dnorm_mean = warp_sum(meta_group_rank, thread_rank, warp_size, dnorm_mean)
+    dnorm_norm_mean = warp_sum(meta_group_rank, thread_rank, warp_size, dnorm_norm_mean)
 
-    dnorm_mean = dnorm_mean / C
-    dnorm_norm_mean = dnorm_norm_mean / C
+    dnorm_mean = dnorm_mean / fp32(C)
+    dnorm_norm_mean = dnorm_norm_mean / fp32(C)
     for i in range(thread_rank, C, warp_size):
         norm_bti = (inp_bt[i] - mean_bt) * rstd_bt 
         dnorm_i = weight[i] * dout_bt[i]
@@ -563,12 +593,12 @@ def layernorm_backward_kernel(dinp, dweight, dbias, dout, inp, weight, mean, rst
         # gradient contribution to weight
         numba.cuda.atomic.add(dweight, i, norm_bti * dout_bt[i])
         # gradient contribution to input
-        dval = 0.0
+        dval = numpy.float32(0.0)
         dval += dnorm_i  # term 1 
         dval -= dnorm_mean  # term 2
         dval -= norm_bti * dnorm_norm_mean  # term 3
         dval *= rstd_bt  # final scale
-        dinp_bt[i] += dval 
+        dinp_bt[i] = dinp_bt[i] + dval
 
 
 def layernorm_backward(dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C):
@@ -650,9 +680,9 @@ def softmax_autoregressive_backward_kernel(dpreatt, datt, att, B, T, C, scale):
            #if numba.cuda.blockIdx.x == 0 and numba.cuda.blockIdx.y == 0 and numba.cuda.threadIdx.x == 0:
            #    print(t2 + t *T + idx * T * T, local_sum, att_bth[t2], datt_bth[t2])
 
-       block_acc[meta_group_rank] = warp_sum(local_sum) 
+       block_acc[meta_group_rank] = warp_sum(meta_group_rank, thread_rank, warp_size, local_sum) 
        numba.cuda.syncthreads()
-       local_sum = warp_sum(block_acc[thread_rank]) 
+       local_sum = warp_sum(meta_group_rank, thread_rank, warp_size, block_acc[thread_rank]) 
        for t3 in range(numba.cuda.threadIdx.x, t + 1, BlockSize):
             acc = att_bth[t3] * (datt_bth[t3] - local_sum)
             dpreatt_bth[t3] = scale * acc
@@ -698,12 +728,7 @@ def attention_backward(dinp, dqkvr, dpreatt, datt, dvaccum, dout, inp, qkvr, att
     cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.N, cublas.Operation.T, HS, T, T, one.ctypes.data, dvaccum.data.ptr, HS, T * HS, att.data.ptr, T, T * T, zero.ctypes.data, dv.data.ptr, HS, T * HS, B * NH)
     # backward into preatt
     scale = 1.0 / math.sqrt(HS);
-    #print4(dpreatt)
     softmax_autoregressive_backward_kernel[(T // 4, B * NH), 256](dpreatt, datt, att, B, T, C, scale)
-    #print4(dpreatt)
-    #print4(datt)
-    #print4(att)
-    #sys.exit(0)
     # backward into q
     cublas.sgemm_strided_batched(cublas_handle, cublas.Operation.N, cublas.Operation.N, HS, T, T, one.ctypes.data, k.data.ptr, HS, T * HS, dpreatt.data.ptr, T, T * T, zero.ctypes.data, dq.data.ptr, HS, T * HS, B * NH)
     # backward into k
@@ -1159,7 +1184,11 @@ class GPT2:
         params = self.params
         acts = self.acts
         encoder_forward(acts.encoded, self.inputs, params.wte, params.wpe, B, T, C, V)
-        compare_tensor(acts.encoded, "acts.encoded", B * T * C)
+        #compare_tensor(acts.encoded, "acts.encoded", B * T * C)
+        #compare_tensor(self.inputs, "model.inputs", B * T, numpy.int32)
+        #compare_tensor(params.wte, "params.wte", V * C)
+        #compare_tensor(params.wpe, "params.wpe", T * C)
+
         for l in range(L):
 
             residual = acts.encoded if l == 0 else acts.residual3[(l-1) * B * T * C:]
@@ -1198,33 +1227,60 @@ class GPT2:
             l_preatt = acts.preatt
             l_v_accum = acts.v_accum
 
+            #compare_tensor(l_ln1w, f"{l}_l_ln1w", C);
+            #compare_tensor(l_ln1b, f"{l}_l_ln1b", C);
+            replace_tensor(residual, f"{l}_residual", B * T * C)
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
-            compare_tensor(l_ln1, f"{l}_l_ln1", B * T * C)
-            compare_tensor(l_ln1_mean, f"{l}_l_ln1_mean", B * T)
-            compare_tensor(l_ln1_rstd, f"{l}_l_ln1_rstd", B * T)
+            #compare_tensor(l_ln1, f"{l}_l_ln1", B * T * C)
+            #compare_tensor(l_ln1_mean, f"{l}_l_ln1_mean", B * T)
+            #compare_tensor(l_ln1_rstd, f"{l}_l_ln1_rstd", B * T)
+            #compare_tensor(l_qkvw, f"{l}_l_qkvw", 3 * C * C);
+            #compare_tensor(l_qkvb, f"{l}_l_qkvb", 3 * C);
+            #replace_tensor(l_qkvw, f"{l}_l_qkvw", 3 * C * C);
+            #replace_tensor(l_qkvb, f"{l}_l_qkvb", 3 * C);
+            replace_tensor(l_ln1, f"{l}_l_ln1", B * T * C)
             matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C)
-            compare_tensor(l_qkv, f"{l}_l_qkv", B * T * 3 * C);
-            attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH)
-            compare_tensor(l_atty, f"{l}_l_atty", B * T * C);
-            compare_tensor(l_v_accum, f"{l}_l_v_accum", B * T * C);
-            compare_tensor(l_qkvr, f"{l}_l_qkvr", B * T * 3 * C);
-            compare_tensor(l_preatt, f"{l}_l_preatt", B * NH * T * T);
-            compare_tensor(l_att, f"{l}_l_att", B * NH * T * T);
+            compare_tensor(l_qkv, f"{l}_l_qkv", B * T * 3 * C)
+
+            #replace_tensor(l_qkv, f"{l}_l_qkv", B * T * 3 * C)
+            attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH, l)
+            #compare_tensor(l_atty, f"{l}_l_atty", B * T * C);
+            #compare_tensor(l_v_accum, f"{l}_l_v_accum", B * T * C);
+            #compare_tensor(l_qkvr, f"{l}_l_qkvr", B * T * 3 * C);
+            #compare_tensor(l_preatt, f"{l}_l_preatt", B * NH * T * T);
+            #compare_tensor(l_att, f"{l}_l_att", B * NH * T * T);
+
             matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C)
-            compare_tensor(l_attproj, f"{l}_l_attproj", B * T * C)
+            #replace_tensor(l_attproj, f"{l}_l_attproj", B * T * C)
+            #compare_tensor(l_attproj, f"{l}_l_attproj", B * T * C)
+
             residual_forward(l_residual2, residual, l_attproj, B*T*C)
-            compare_tensor(l_residual2, f"{l}_l_residual2", B * T * C)
+            #compare_tensor(l_residual2, f"{l}_l_residual2", B * T * C)
+
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C)
+
+            #replace_tensor(l_ln2, f"{l}_l_ln2", B * T * C)
             matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C)
+            #replace_tensor(l_fch, f"{l}_l_fch", B * T * 4* C)
+
             gelu_forward(l_fch_gelu, l_fch, B*T*4*C)
+            #compare_tensor(l_fch_gelu, f"{l}_l_fch_gelu", B * T * 4* C)
+
             matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C)
+            #replace_tensor(l_fcproj, f"{l}_l_fcproj", B * T * C)
+            #replace_tensor(l_residual2, f"{l}_l_residual2", B * T * C)
+
             residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C)
+            #compare_tensor(l_residual3, f"{l}_l_residual3", B * T * C)
 
         residual = acts.residual3[(L-1) * B * T * C:] # last residual is in residual3
         layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C)
         matmul_forward_cublas(acts.logits, acts.lnf, params.wte, None, B, T, C, V)
         if targets is not None:
+            #replace_tensor(acts.logits, "logits_i", B * T * V)
             fused_classifier3(acts.logits, acts.losses, self.targets.ravel(), B, T, V, V)
+            #compare_tensor(acts.logits, "logits", B * T * V)
+            #compare_tensor(acts.losses, "losses", B * T)
             self.cpu_losses = cupy.asnumpy(acts.losses[:B * T])
             mean_loss = numpy.mean(self.cpu_losses)
             self.mean_loss = mean_loss;
@@ -1293,19 +1349,14 @@ class GPT2:
             # total, final loss as the mean over all losses over all (B,T) positions in the batch
             # next: backward the classifier matmul
             matmul_backward(grads_acts.lnf, grads.wte, None, acts.logits, acts.lnf, params.wte, B, T, C, V)
-            #print4(grads_acts.lnf)
-            #print4(grads.wte)
-            compare_tensor(acts.lnf, "acts.lnf", B * T * C);
-            compare_tensor(params.wte, "params.wte", V * C);
-            compare_tensor(grads_acts.lnf, "grad_acts.lnf", B * T * C);
-            compare_tensor(grads.wte, "grads.wte", V * C);
+            #compare_tensor(acts.lnf, "acts.lnf", B * T * C);
+            #compare_tensor(params.wte, "params.wte", V * C);
+            #compare_tensor(grads_acts.lnf, "grad_acts.lnf", B * T * C);
+            #compare_tensor(grads.wte, "grads.wte", V * C);
             #sys.exit(0)
             residual = acts.residual3[(L-1) * B * T * C:]  # last residual is in residual3
             dresidual = grads_acts.residual3  # the main buffer holding the gradient in the backward pass
             layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C)
-            #print4(dresidual)
-            #print4(grads.lnfw)
-            #print4(grads.lnfb)
             # now backward all the layers
             for l in range(L-1, -1, -1):
                 residual = acts.encoded if l == 0 else acts.residual3[(l-1) * B * T * C:]
@@ -1356,27 +1407,55 @@ class GPT2:
                 dl_ln2 = grads_acts.ln2
                 dl_fch = grads_acts.fch
                 dl_fch_gelu = grads_acts.fch_gelu
+                #replace_tensor(dresidual, f"{l}_dresidual", B *T * C)
+                #replace_tensor(l_fch_gelu, f"{l}_l_fch_gelu", B *T* 4 *C)
+                #replace_tensor(l_fcprojw, f"{l}_l_fcprojw", C * 4 * C)
                 matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4*C, C)
+                #compare_tensor(dl_fch_gelu, f"{l}_dl_fch_gelu", B * T * 4 *C)
+                #compare_tensor(dl_fcprojw, f"{l}_dl_fcprojw",  C * 4 *C)
+                #compare_tensor(dl_fcprojb, f"{l}_dl_fcprojb", C)
+
+                #replace_tensor(dl_fch_gelu, f"{l}_dl_fch_gelu", B * T * 4 *C)
+                #replace_tensor(l_fch, f"{l}_l_fch", B * T * 4 *C)
                 gelu_backward(dl_fch, l_fch, dl_fch_gelu, B*T*4*C)
+                #compare_tensor(dl_fch, f"{l}_dl_fch", B * T * 4 *C)
+
                 matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4*C)
+
                 # layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+                #replace_tensor(dresidual, f"{l}_dresidual_i", B*T*C)
+                #replace_tensor(dl_ln2, f"{l}_dl_ln2", B *T *C)
+                #replace_tensor(l_residual2, f"{l}_l_residual2", B *T *C)
+                #replace_tensor(l_ln2w, f"{l}_l_ln2w", C)
+                #replace_tensor(l_ln2_mean, f"{l}_l_ln2_mean", B *T )
+                #replace_tensor(l_ln2_rstd, f"{l}_l_ln2_rstd", B *T )
                 layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C)
+                #compare_tensor(dresidual, f"{l}_dresidual", B*T*C)
+                #compare_tensor(dl_ln2w, f"{l}_dl_ln2w", C )
+                #compare_tensor(dl_ln2b, f"{l}_dl_ln2b", C )
+
                 matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C)
-                #print4(dl_atty)
-                #print4(dl_attprojw)
-                #print4(dl_attprojb)
+
+                #replace_tensor(dl_atty, f"{l}_dl_atty", B * T * C)
+                #replace_tensor(l_qkv, f"{l}_l_qkv", B * T * 3 * C)
+                #replace_tensor(l_qkvr, f"{l}_l_qkvr", B * T * 3 * C)
+                #replace_tensor(l_att, f"{l}_l_att", B * NH * T * T)
                 attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_att, B, T, C, NH)
-                #print4(dl_qkv);
-                #print4(dl_qkvr);
-                #print4(dl_preatt);
-                #print4(dl_att);
-                #print4(dl_v_accum);
-                #print4(dl_atty);
+                #compare_tensor(dl_qkv, f"{l}_dl_qkv", B * T * 3 * C)
+                #compare_tensor(dl_qkvr, f"{l}_dl_qkvr", B * T * 3 * C)
+                #compare_tensor(dl_preatt, f"{l}_dl_preatt", B * NH * T * T)
+                #compare_tensor(dl_att, f"{l}_dl_att", B * NH * T * T)
+                #compare_tensor(dl_v_accum, f"{l}_dl_v_accum", B * T * C)
+
                 matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C)
                 # layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
                 layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
-                #print4(dresidual)
+            #replace_tensor(dresidual, "dresidual", B * T * C)
+            #replace_tensor(grads.wte, "gwte_i", V * C)
+            #replace_tensor(grads.wpe, "gwpe_i", T * C)
             encoder_backward(grads.wte, grads.wpe, dresidual, self.inputs, B, T, C)
+            #compare_tensor(grads.wte, "gwte", V * C)
+            #compare_tensor(grads.wpe, "gwpe", T * C)
 
     def update(self, learning_rate, beta1, beta2, eps, weight_decay, t):
         # reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
@@ -1477,30 +1556,32 @@ def main():
     tokenizer = Tokenizer()
     tokenizer.init("gpt2_tokenizer.bin")
 
-    for step in range(train_num_batches):
-        last_step = step == train_num_batches
-        # once in a while estimate the validation loss
-        if step % val_loss_every == 0 or last_step:
-            val_loss = 0.0
-            val_loader.reset()
-            for i in range(val_num_batches):
-                val_loader.next_batch()
-                model.forward(val_loader.inputs(), val_loader.targets(), B, T)
-                val_loss += model.mean_loss
-            val_loss /= val_num_batches;
-            print(f"val loss {val_loss}");
-            #logger_log_val(&logger, step, val_loss);
+    for epoch in range(10):
+        for step in range(train_num_batches):
+            last_step = step == train_num_batches
+            # once in a while estimate the validation loss
+            #if step % val_loss_every == 0 or last_step:
+            #    val_loss = 0.0
+            #    val_loader.reset()
+            #    for i in range(val_num_batches):
+            #        val_loader.next_batch()
+            #        model.forward(val_loader.inputs(), val_loader.targets(), B, T)
+            #        val_loss += model.mean_loss
+            #    val_loss /= val_num_batches;
+            #    print(f"val loss {val_loss}");
+            #    #logger_log_val(&logger, step, val_loss);
 
-        if last_step:
-            break
-        start = time.time()
-        train_loader.next_batch()
+            if last_step:
+                break
+            start = time.time()
+            train_loader.next_batch()
  
-        model.forward(train_loader.inputs(), train_loader.targets(), B, T)
-        model.zero_grad()
-        model.backward()
-        model.update(learning_rate, 0.9, 0.999, 1e-8, 0.0, step+1)
-        print(f"step {step+1}/{train_num_batches}: train loss {model.mean_loss} ({int((time.time() - start)*1000)} ms)")
+            model.forward(train_loader.inputs(), train_loader.targets(), B, T)
+            model.zero_grad()
+            model.backward()
+            exit(1)
+            model.update(learning_rate, 0.9, 0.999, 1e-8, 0.0, step+1)
+            print(f"step {step+1}/{train_num_batches}: train loss {model.mean_loss} ({int((time.time() - start)*1000)} ms)")
 
 if __name__ == "__main__":
     main()
