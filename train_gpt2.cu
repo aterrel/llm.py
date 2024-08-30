@@ -2116,7 +2116,7 @@ int main(int argc, char *argv[]) {
         int last_step = step == train_num_batches;
 
         // once in a while estimate the validation loss
-        /*if (step % val_loss_every == 0 || last_step) {
+        if (step % val_loss_every == 0 || last_step) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
@@ -2127,7 +2127,7 @@ int main(int argc, char *argv[]) {
             val_loss /= val_num_batches;
             printf("val loss %f\n", val_loss);
             logger_log_val(&logger, step, val_loss);
-        }*/
+        }
 
         // once in a while do model inference to print generated text
         /*if (step > 0 && step % sample_every == 0 || last_step) {

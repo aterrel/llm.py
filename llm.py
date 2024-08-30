@@ -1551,19 +1551,19 @@ def main():
     tokenizer = Tokenizer()
     tokenizer.init("gpt2_tokenizer.bin")
 
-    for step in range(train_num_batches):
+    for step in range(train_num_batches + 1):
         last_step = step == train_num_batches
         # once in a while estimate the validation loss
-        #if step % val_loss_every == 0 or last_step:
-        #    val_loss = 0.0
-        #    val_loader.reset()
-        #    for i in range(val_num_batches):
-        #        val_loader.next_batch()
-        #        model.forward(val_loader.inputs(), val_loader.targets(), B, T)
-        #        val_loss += model.mean_loss
-        #    val_loss /= val_num_batches;
-        #    print(f"val loss {val_loss}");
-        #    #logger_log_val(&logger, step, val_loss);
+        if step % val_loss_every == 0 or last_step:
+            val_loss = 0.0
+            val_loader.reset()
+            for i in range(val_num_batches):
+                val_loader.next_batch()
+                model.forward(val_loader.inputs(), val_loader.targets(), B, T)
+                val_loss += model.mean_loss
+            val_loss /= val_num_batches;
+            print(f"val loss {val_loss}");
+            #logger_log_val(&logger, step, val_loss);
 
         if last_step:
             break
