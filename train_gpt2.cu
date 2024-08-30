@@ -138,27 +138,9 @@ cublasLtHandle_t cublaslt_handle;
 
 namespace cg = cooperative_groups;
 
-__device__ float warp_reduce(cg::thread_block_tile<32>& warp, float val) {
-    //return cg::reduce(warp, val, cg::plus<float>{});
-    for (int offset = 16; offset > 0; offset /= 2)
-       val += __shfl_down_sync(0xffffffff, val, offset);
-    __shared__ float sums[1024];
-    if (warp.thread_rank() == 0) {
-       sums[warp.meta_group_rank() * 32] = val;
-    }
-    __syncthreads();
-    return sums[warp.meta_group_rank() * 32];
-    //__shared__ float sums[1024];
-    //sums[threadIdx.x] = val;
-    //__syncthreads();
-    //if (warp.thread_rank == 0) {
-    //    for (int i=(warp.meta_group_rank() * 32 + 1); i< (warp.meta_group_rank() *32 + 32); i++){
-    //        sums[warp.meta_group_rank() * 32] += sums[i];
-    //    }
-    //}
-    //__syncthreads();
-    //return sums[warp.meta_group_rank() * 32];
 
+__device__ float warp_reduce(cg::thread_block_tile<32>& warp, float val) {
+    return cg::reduce(warp, val, cg::plus<float>{});
 }
 
 // ----------------------------------------------------------------------------
@@ -420,7 +402,7 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     const float4* x_vec = reinterpret_cast<const float4*>(x);
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
         float4 v = x_vec[i];
-        float old_maxval = maxval;
+        float old_maxval =  maxval;
         for(int k = 0; k < 4; ++k) {
             maxval = fmaxf(maxval, vec_at(v, k));
         }
@@ -440,10 +422,8 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
     sumval *= expf(inv_temperature * (maxval - global_maxval));
 
-    //float sum = cg::reduce(warp, sumval, cg::plus<float>{});
     float sum = warp_reduce(warp, sumval);
     float norm = 1.f / sum;
-
     // divide the whole row by the sum
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
         // recalculation is faster than doing the round-trip through memory.
@@ -634,7 +614,7 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
     float* dinp_bt = dinp + b * T * C + t * C;
     float mean_bt = mean[b * T + t];
     float rstd_bt = rstd[b * T + t];
-
+    //if (blockIdx.x == 0 && warp.meta_group_rank() == 0) printf("%d Mean is %f\n",warp.thread_rank(), mean_bt);
     // first: two reduce operations
     float dnorm_mean = 0.0f;
     float dnorm_norm_mean = 0.0f;
@@ -645,8 +625,6 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
         dnorm_norm_mean += dnorm_i * norm_bti;
     }
 
-    //dnorm_mean = cg::reduce(warp, dnorm_mean, cg::plus<float>{});
-    //dnorm_norm_mean = cg::reduce(warp, dnorm_norm_mean, cg::plus<float>{});
     dnorm_mean = warp_reduce(warp, dnorm_mean);
     dnorm_norm_mean = warp_reduce(warp, dnorm_norm_mean);
     dnorm_mean = dnorm_mean / C;
@@ -662,9 +640,11 @@ __global__ void layernorm_backward_kernel(float* dinp, float* dweight, float* db
 
         // gradient contribution to bias
         dbias_ref.fetch_add(dout_bt[i], cuda::memory_order_relaxed);
-
         // gradient contribution to weight
         dweight_ref.fetch_add(norm_bti * dout_bt[i], cuda::memory_order_relaxed);
+
+        //atomic_ordered_add(&dbias[i], dout_bt[i]);
+        //atomic_ordered_add(&dweight[i], norm_bti * dout_bt[i]);
 
         // gradient contribution to input
         float dval = 0.0f;
@@ -1046,12 +1026,12 @@ void attention_forward(float* out, float* vaccum, float* qkvr, float* preatt, fl
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS, &alpha, k, HS, T * HS, q, HS, T * HS, &beta, preatt, T, T * T, B * NH));
-    //dump_tensor(preatt, std::to_string(l)+"_preatt", B * NH * T  * T);
+    // dump_tensor(preatt, std::to_string(l)+"_preatt", B * NH * T  * T);
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
     int grid_size = CEIL_DIV(B * NH * T * 32, softmax_block_size);
     softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
-    //dump_tensor(att, std::to_string(l)+"_att", B * NH * T  * T);
+    // dump_tensor(att, std::to_string(l)+"_att", B * NH * T  * T);
     cudaCheck(cudaGetLastError());
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
@@ -1527,15 +1507,15 @@ void gpt2_forward(GPT2 &model, int* inputs, int* targets, int B, int T) {
         float* l_v_accum = acts.v_accum;
 
         // now do the forward pass
-     dump_tensor(residual, std::to_string(l)+"_residual", B * T * C);
+     //dump_tensor(residual, std::to_string(l)+"_residual", B * T * C);
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-     dump_tensor(l_ln1, std::to_string(l)+"_l_ln1", B * T * C);
+     //dump_tensor(l_ln1, std::to_string(l)+"_l_ln1", B * T * C);
     // dump_tensor(l_ln1_mean, std::to_string(l)+"_l_ln1_mean", B * T);
     // dump_tensor(l_ln1_rstd, std::to_string(l)+"_l_ln1_rstd", B * T);
-    // dump_tensor(l_ln1w, std::to_string(l)+"_l_ln1w", C);
-    // dump_tensor(l_ln1b, std::to_string(l)+"_l_ln1b", C);
+    //dump_tensor(l_ln1w, std::to_string(l)+"_l_ln1w", C);
+    //dump_tensor(l_ln1b, std::to_string(l)+"_l_ln1b", C);
         matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-    // dump_tensor(l_qkv, std::to_string(l)+"_l_qkv", B * T * 3 * C);
+    //dump_tensor(l_qkv, std::to_string(l)+"_l_qkv", B * T * 3 * C);
     // dump_tensor(l_qkvw, std::to_string(l)+"_l_qkvw", 3 * C * C);
     // dump_tensor(l_qkvb, std::to_string(l)+"_l_qkvb", 3 * C);
         attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH, l);
@@ -1569,10 +1549,10 @@ void gpt2_forward(GPT2 &model, int* inputs, int* targets, int B, int T) {
     if (targets != NULL) {
         // fused classifier: does the forward pass and first part of the backward pass
         // we're passing dlosses = NULL, which will default them to 1.0f/(B*T), i.e. uniform loss
-        //dump_tensor(acts.logits, "logits_i", B * T * V);
+        // dump_tensor(acts.logits, "logits_i", B * T * V);
         fused_classifier3(acts.logits, acts.losses, NULL, thrust::raw_pointer_cast(model.targets.data()), B, T, V, V); 
-        //dump_tensor(acts.logits, "logits", B * T * V);
-        //dump_tensor(acts.losses, "losses", B * T);
+        // dump_tensor(acts.logits, "logits", B * T * V);
+        // dump_tensor(acts.losses, "losses", B * T);
         //exit(1);
         // for convenience also evaluate the mean loss (TODO re-think this compute+sync point)
         // move the (B,T) losses to CPU
@@ -1661,7 +1641,14 @@ void gpt2_backward(GPT2 &model) {
     // backward the final layernorm
     float* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     float* dresidual = grads_acts.residual3; // the main buffer holding the gradient in the backward pass
+    //        dump_tensor(acts.lnf_mean, "acts.lnf_mean", B * T);
+    //        dump_tensor(acts.lnf_rstd, "acts.lnf_rstd", B * T);
+    //        dump_tensor(params.lnfw, "params.lnfw", C);
+    //        dump_tensor(residual, "residual", B * T * C);
+    //        dump_tensor(dresidual, "dresidual_i", B * T * C);
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C);
+    //dump_tensor(thrust::raw_pointer_cast(model.grads_memory.data()), "grads", model.num_parameters);
+    //        dump_tensor(dresidual, "dresidual_ln", B * T * C);
     // now backward all the layers
     for (int l = L-1; l >= 0; l--) {
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
@@ -1749,21 +1736,22 @@ void gpt2_backward(GPT2 &model) {
         //dump_tensor(l_qkvr, std::to_string(l)+"_l_qkvr", B * T * 3 * C);
         //dump_tensor(l_att, std::to_string(l)+"_l_att", B * NH * T * T);
         attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_att, B, T, C, NH);
-        //dump_tensor(dl_qkv, std::to_string(l)+"_dl_qkv", B * T * 3 * C);
-        //dump_tensor(dl_qkvr, std::to_string(l)+"_dl_qkvr", B * T * 3 * C);
-        //dump_tensor(dl_preatt, std::to_string(l)+"_dl_preatt", B * NH * T * T);
-        //dump_tensor(dl_att, std::to_string(l)+"_dl_att", B * NH * T * T);
-        //dump_tensor(dl_v_accum, std::to_string(l)+"_dl_v_accum", B * T * C);
+        // dump_tensor(dl_qkv, std::to_string(l)+"_dl_qkv", B * T * 3 * C);
+        // dump_tensor(dl_qkvr, std::to_string(l)+"_dl_qkvr", B * T * 3 * C);
+        // dump_tensor(dl_preatt, std::to_string(l)+"_dl_preatt", B * NH * T * T);
+        // dump_tensor(dl_att, std::to_string(l)+"_dl_att", B * NH * T * T);
+        // dump_tensor(dl_v_accum, std::to_string(l)+"_dl_v_accum", B * T * C);
         matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3*C);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C);
     }
-    dump_tensor(dresidual, "dresidual", B * T * C);
-    dump_tensor(grads.wte, "gwte_i", V * C);
-    dump_tensor(grads.wpe, "gwpe_i", T * C);
+    //dump_tensor(dresidual, "dresidual", B * T * C);
+    //dump_tensor(grads.wte, "gwte_i", V * C);
+    //dump_tensor(grads.wpe, "gwpe_i", T * C);
     encoder_backward(grads.wte, grads.wpe, dresidual, thrust::raw_pointer_cast(model.inputs.data()), B, T, C);
-    dump_tensor(grads.wte, "gwte", V * C);
-    dump_tensor(grads.wpe, "gwpe", T * C);
+    //dump_tensor(grads.wte, "gwte", V * C);
+    //dump_tensor(grads.wpe, "gwpe", T * C);
+    //exit(0);
 }
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
@@ -2190,8 +2178,9 @@ int main(int argc, char *argv[]) {
         gpt2_forward(model, train_loader.inputs(), train_loader.targets(), B, T);
         gpt2_zero_grad(model);
         gpt2_backward(model);
-        exit(1);
         gpt2_update(&model, learning_rate, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+        //dump_tensor( thrust::raw_pointer_cast(model.grads_memory.data()), "grads_"+std::to_string(step), model.num_parameters);
+        //dump_tensor( thrust::raw_pointer_cast(model.params_memory.data()), "parameters_"+std::to_string(step), model.num_parameters);
         cudaCheck(cudaDeviceSynchronize()); // finish all CUDA work to get correct precise timings
         auto end = std::chrono::steady_clock::now();
         double time_elapsed_s = std::chrono::duration<double>(end - start).count();
