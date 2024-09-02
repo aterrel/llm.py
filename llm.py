@@ -130,6 +130,7 @@ def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
 def ceil_div(a, b):
     return -(a // -b)
 
+
 def layernorm_forward(out, mean,  rstd, inp, weight, bias, B, T, C):
     block_size = 512
     N = B * T
@@ -369,8 +370,15 @@ def i2n_2(idx, E1, E2):
     return (b, t, c)
 
 
+@numba.cuda.jit('void(float32[:], float32[:], float32[:])', fastmath=True)
+def residual_forward_kernel(out, x, y):
+    idx = numba.cuda.grid(1)
+    out[idx] = x[idx] + y[idx]
+
 def residual_forward(out, inp1, inp2, N):
-    cupy.add(inp1[:N], inp2[:N], out=out[:N])
+    threads_per_block = 256  
+    blocks_per_grid = (N + threads_per_block - 1) // threads_per_block
+    residual_forward_kernel[blocks_per_grid, threads_per_block](out, inp1, inp2)
 
 
 @numba.cuda.jit(fastmath=True)
@@ -387,7 +395,7 @@ def encoder_forward(out, inpv, wte, wpe, B, T, C, V):
     wte_md = wte.reshape(V, C)
     wpe_md = wpe.reshape(T, C)
     inp_md = inpv.reshape(B, T)
-    threads_per_block = 256  
+    threads_per_block = 256
     blocks_per_grid = (out.size + threads_per_block - 1) // threads_per_block
     encoder_forward_kernel[blocks_per_grid, threads_per_block](out_md, wte_md, wpe_md, inp_md, C, T)
 
@@ -490,6 +498,133 @@ def fused_classifier3(logits, losses, targets, B, T, V, P):
     N = B * T;
     grid_size = N;
     fused_classifier_kernel3[grid_size, block_size](logits, losses, targets, B, T, V, P)
+
+"""
+@numba.cuda.jit('void(float32[:], float32[:], int32, int32)', fastmath=True)
+def softmax_forward_kernel7(out, inp, N, C):
+    warp_size = 32
+    meta_group_size = numba.cuda.blockDim.x // warp_size;
+    meta_group_rank = numba.cuda.threadIdx.x // warp_size;
+    thread_rank = numba.cuda.threadIdx.x % warp_size
+
+    # same as kernel4, but optimised for very large Cs with advanced unrolling
+
+    # The trick is to read into a register array (all indices known at compile time)
+    # and always read UNROLL_FACTOR values to maximise memory level parallelism
+    # even if we would be out of bounds, we set the index to min(C-1, idx)
+    # so we just do some unnecessary reads (obviously bad for small C)
+    # the writes are in a separate loop with a conditional check for out of bounds
+    # making it separate is necessary to convince the compiler to do the right thing
+    UNROLL_FACTOR = 8
+    warps_per_block = meta_group_size
+
+    shared = numba.cuda.shared.array(shape=(2 * numba.cuda.blockDim.x / 32 * 4), dtype=numba.float32)  # extern __shared__ 2 * block_size / 32 * sizeof(float)
+    idx = numba.cuda.blockIdx.x
+    tid = numba.cuda.threadIdx.x
+    warpId = meta_group_rank
+    laneId = thread_rank
+    maxvals = shared
+    sumvals = shared[warpsPerBlock:]
+    if tid >= C:
+        maxvals[warpId] = -math.inf
+        sumvals[warpId] = fp32(0.0)
+        return
+    x = inp[idx * C:]
+    y = out[idx * C:]
+
+    # first, thread coarsening by directly accessing global memory in series
+    maxval = -math.inf
+    for i in range(tid, C, numba.cuda.blockDim.x * UNROLL_FACTOR):
+        for u in range(UNROLL_FACTOR):
+            maxval = numba.cuda.libdevice.fmaxf(maxval, x[math.min(C - 1, i + u * numba.cuda.blockDim.x)])
+
+    maxval = warp_maxval(maxval)
+    # now within-warp reductions for maxval
+    # the 0th thread of each warp writes the maxval of that warp to shared memory
+    if laneId == 0:
+        maxvals[warpId] = maxval
+
+    numba.cuda.syncthreads()
+    # now the 0th thread reduces the maxvals in shared memory, i.e. across warps
+
+    if tid == 0:
+        val = maxvals[tid]
+        for i in range(1, warpsPerBlock):
+        #pragma unroll
+        for (int i = 1; i < warpsPerBlock; i++) {
+            val = numba.cuda.libdevice.fmaxf(val, maxvals[i])
+        }
+        # store the final max in the first position
+        maxvals[0] = val
+    }
+    numba.cuda.syncthreads()
+    # broadcast the max to all threads
+    offset = maxvals[0]
+
+    // compute expf and write the result to global memory
+    // + thread coarsening for sum
+    float sumval = 0.0f;
+    for (int i = tid; i < C; i += block.size() * UNROLL_FACTOR) {
+        float reg_array[UNROLL_FACTOR];
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            reg_array[u] = __ldcs(&x[min(C - 1, i + u * block.size())]);
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            if (i + u * block.size() < C) {
+                float output = expf(reg_array[u] - offset);
+                y[min(C - 1, i + u * block.size())] = output; // compiler likes redundant min()?!
+                sumval += output; // combined into the same loop unlike kernel3
+            }
+        }
+    }
+
+    // okay now we calculated exp(x - max(x))
+    // step 2: sum all the values and divide by the sum
+
+    // within-warp reduction for sumval
+    //sumval = cg::reduce(warp, sumval, cg::plus<float>{});
+    sumval = warp_reduce(warp, sumval);
+
+    // write sumval to shared memory
+    if (laneId == 0) sumvals[warpId] = sumval;
+    __syncthreads();
+    // inter-thread reduction of sum
+    if (tid == 0) {
+        float val = sumvals[tid];
+        #pragma unroll
+        for (int i = 1; i < warpsPerBlock; ++i) {
+            val += sumvals[i];
+        }
+        sumvals[0] = val;
+    }
+    __syncthreads();
+    // broadcast the sum to all threads
+    float sum = sumvals[0];
+
+    // divide the whole row by the sum
+    for (int i = tid; i < C; i += block.size() * UNROLL_FACTOR) {
+        float reg_array[UNROLL_FACTOR];
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            reg_array[u] = y[min(C - 1, i + u * block.size())];
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL_FACTOR; u++) {
+            if (i + u * block.size() < C) {
+                y[i + u * block.size()] = reg_array[u] / sum;
+            }
+        }
+    }
+}
+"""
+
+
+def softmax_forward(out, inp, N, C):
+    grid_size = N
+    block_size = 512
+    softmax_forward_kernel7[grid_size, block_size](out, inp, N, C)
 
 """
 ------------------------------------------------------------
@@ -1269,7 +1404,8 @@ class GPT2:
             self.mean_loss = mean_loss;
             #print(mean_loss)
         else:
-            pass
+            softmax_forward(acts.probs, acts.logits, B*T, V)
+            self.mean_loss = -1
 
     def zero_grad(self):
         if self.grads_memory is not None:
@@ -1504,6 +1640,8 @@ def main():
     print(f"val_max_batches: {val_max_batches}")
     print(f"sample_every: {sample_every}")
     print(f"genT: {genT}")
+
+    numba.config.CUDA_ARRAY_INTERFACE_SYNC = False
 
     # set up the device
     deviceIdx = 0
