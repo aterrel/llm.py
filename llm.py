@@ -2,27 +2,26 @@ import argparse
 import math
 import os
 import struct
-import sys
 import time
 
+import cuda.cooperative.experimental as cudax
 import cupy
 import cupyx
 import numba.cuda
 import numpy
-
-import cuda.cooperative.experimental as cudax
-from pynvjitlink import patch
-from cuda import cuda, cudart, nvrtc
 import nvmath.linalg
+from cuda import cuda, cudart, nvrtc
 from nvmath.bindings import cublas
 from nvmath.bindings import cublasLt as cublaslt
+from pynvjitlink import patch
 
 
-cublaslt_workspace_size = 32 * 1024 * 1024
-cublaslt_workspace = None
-cublas_compute_type = None
-cublas_handle = None
-cublaslt_handle = None
+class CublasState:
+    cublaslt_workspace_size = 32 * 1024 * 1024
+    cublaslt_workspace = None
+    cublas_compute_type = None
+    cublas_handle = None
+    cublaslt_handle = None
 
 
 def _cudaGetErrorEnum(error):
@@ -149,11 +148,11 @@ def layernorm_forward(out, mean, rstd, inp, weight, bias, B, T, C):
 
 
 def matmul_forward_cublas(out, inp, weight, bias, B, T, C, OC):
-    assert bias == None  # bias is not supported for this kernel
+    assert bias is None  # bias is not supported for this kernel
     alpha = numpy.array(1.0, dtype=numpy.float32)
     beta = numpy.array(0.0, dtype=numpy.float32)
     cublas.sgemm(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.T,
         cublas.Operation.N,
         OC,
@@ -210,13 +209,14 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     # check bias alignment
     if bias.data.ptr % 16 != 0:
         raise RuntimeError("Bias pointer is not aligned (cuBLASLt requirement)!\n")
-    returnedResults = 0
     # create the operation descriptor
     opNoTranspose = cublas.Operation.N
     opTranspose = cublas.Operation.T
     epilogueBias = cublaslt.Epilogue.BIAS
     cuda_r_32f = nvmath.CudaDataType.CUDA_R_32F
-    operation_desc = cublaslt.matmul_desc_create(cublas_compute_type, cuda_r_32f)
+    operation_desc = cublaslt.matmul_desc_create(
+        CublasState.cublas_compute_type, cuda_r_32f
+    )
     cublaslt_setattr(operation_desc, "TRANSA", opTranspose)
     cublaslt_setattr(operation_desc, "TRANSB", opNoTranspose)
     cublaslt_setattr(operation_desc, "EPILOGUE", epilogueBias)
@@ -230,7 +230,7 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     bias_layout = cublaslt.matrix_layout_create(cuda_r_32f, OC, 1, OC)
     preference = cublaslt.matmul_preference_create()
     cublaslt_set_preference_attr(
-        preference, "MAX_WORKSPACE_BYTES", cublaslt_workspace_size
+        preference, "MAX_WORKSPACE_BYTES", CublasState.cublaslt_workspace_size
     )
 
     # find a suitable algorithm
@@ -246,7 +246,7 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     algorithms_buffer = numpy.zeros((1,), dtype=algorithm_dtype)
     num_algorithms = numpy.zeros((1,), dtype=numpy.int32)
     cublaslt.matmul_algo_get_heuristic(
-        cublaslt_handle,
+        CublasState.cublaslt_handle,
         operation_desc,
         weight_layout,
         input_layout,
@@ -266,7 +266,7 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     alpha = numpy.array(1.0, dtype=numpy.float32)
     beta = numpy.array(0.0, dtype=numpy.float32)
     cublaslt.matmul(
-        cublaslt_handle,
+        CublasState.cublaslt_handle,
         operation_desc,
         alpha.ctypes.data,
         weight.data.ptr,
@@ -279,8 +279,8 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
         out.data.ptr,
         output_layout,
         algorithms_buffer[0]["algorithm"].ctypes.data,
-        cublaslt_workspace.data.ptr,
-        cublaslt_workspace_size,
+        CublasState.cublaslt_workspace.data.ptr,
+        CublasState.cublaslt_workspace_size,
         0,
     )
 
@@ -348,7 +348,9 @@ def softmax_forward_kernel5(out, inv_temperature, inp, flt_max, N, T):
         out[idx * T + i] = ev * norm
 
 
-@numba.cuda.jit(device=True, fastmath=True)
+@numba.cuda.jit(
+    "UniTuple(int32, 4)(int32, int32, int32, int32)", device=True, fastmath=True
+)
 def i2n_4(idx, E1, E2, E3):
     b = idx // (E1 * E2 * E3)
     rest = idx % (E1 * E2 * E3)
@@ -359,7 +361,11 @@ def i2n_4(idx, E1, E2, E3):
     return (b, t, nh_, hs)
 
 
-@numba.cuda.jit(fastmath=True)
+# @numba.cuda.jit(fastmath=True)
+@numba.cuda.jit(
+    "void(float32[:], float32[:], float32[:], float32[:,:,:,:,:], int32, int32, int32, int32)",
+    fastmath=True,
+)
 def qkv_inp_kernel(q, k, v, inp, NH, T, HS, size):
     idx = numba.cuda.grid(1)
     # Ensure the thread is within the bounds of the array
@@ -376,7 +382,9 @@ def qkv_inp(q, k, v, inp, NH, T, HS, size):
     qkv_inp_kernel[blocks_per_grid, threads_per_block](q, k, v, inp, NH, T, HS, size)
 
 
-@numba.cuda.jit(fastmath=True)
+@numba.cuda.jit(
+    "void(float32[:], float32[:], int32, int32, int32, int32)", fastmath=True
+)
 def scatter_kernel(out, vaccum, NH, T, HS, size):
     idx = numba.cuda.grid(1)
     # Ensure the thread is within the bounds of the array
@@ -391,8 +399,7 @@ def scatter(out, vaccum, NH, T, HS, size):
     scatter_kernel[blocks_per_grid, threads_per_block](out, vaccum, NH, T, HS, size)
 
 
-def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, l):
-    block_size = 256
+def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
     softmax_block_size = 256
     HS = C // NH  # head size
 
@@ -408,7 +415,7 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, l):
     alpha = numpy.array(1.0, dtype=numpy.float32)
     beta = numpy.array(0.0, dtype=numpy.float32)
     cublas.sgemm_strided_batched(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.T,
         cublas.Operation.N,
         T,
@@ -439,7 +446,7 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, l):
     # new approach: first cuBLAS another batched matmul
     # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublas.sgemm_strided_batched(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.N,
         cublas.Operation.N,
         HS,
@@ -464,6 +471,7 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, l):
     scatter(out, vaccum, NH, T, HS, B * T * C)
 
 
+# @numba.cuda.jit('UniTuple(int32, 3)(int32, int32, int32)', device=True, fastmath=True)
 @numba.cuda.jit(device=True, fastmath=True)
 def i2n_2(idx, E1, E2):
     bt = idx // E1
@@ -537,11 +545,6 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
     x = inp[idx * P :]
     thread_maxval = fp32(-math.inf)
     thread_sumval = fp32(0.0)
-
-    warp_size = 32
-    meta_group_size = numba.cuda.blockDim.x // warp_size
-    meta_group_rank = numba.cuda.threadIdx.x // warp_size
-    thread_rank = numba.cuda.threadIdx.x % warp_size
 
     # do the loop in reverse to maximise probability of L2 cache hits
     # so even small L2s get some hits on the 2nd read of the same thread
@@ -703,9 +706,9 @@ def softmax_forward_kernel7(out, inp, N, C):
         for u in range(UNROLL_FACTOR):
             if (i + u * numba.cuda.blockDim.x) < C:
                 output = math.exp(reg_array[u] - offset)
-                y[min(C - 1, i + u * numba.cuda.blockDim.x)] = (
-                    output  # compiler likes redundant min()?
-                )
+                y[
+                    min(C - 1, i + u * numba.cuda.blockDim.x)
+                ] = output  # compiler likes redundant min()?
                 sumval += output  # combined into the same loop unlike kernel3
 
     # okay now we calculated exp(x - max(x))
@@ -785,7 +788,7 @@ def matmul_backward(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC):
     zero = numpy.array(0.0, dtype=numpy.float32)
     # backward to input, uses = in the backward pass (set the gradient)
     cublas.sgemm(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.N,
         cublas.Operation.N,
         C,
@@ -802,7 +805,7 @@ def matmul_backward(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC):
     )
     # backward to weight, uses += in the backward pass (accumulate the gradient)
     cublas.sgemm(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.N,
         cublas.Operation.T,
         C,
@@ -911,7 +914,9 @@ def gelu_backward(dinp, inp, dout, N):
     gelu_backward_kernel[grid_size, block_size](dinp, inp, dout, N)
 
 
-@numba.cuda.jit(fastmath=True)
+@numba.cuda.jit(
+    "void(float32[:], float32[:], int32, int32, int32, int32)", fastmath=True
+)
 def unpermute_kernel_backward(dinp, dout, B, N, NH, d):
     idx = numba.cuda.grid(1)
     if idx < (B * NH * N * d):
@@ -935,7 +940,6 @@ def softmax_autoregressive_backward_kernel(dpreatt, datt, att, B, T, C, scale):
     T_per_block = 4
 
     warp_size = 32
-    meta_group_size = numba.cuda.blockDim.x // warp_size
     meta_group_rank = numba.cuda.threadIdx.x // warp_size
     thread_rank = numba.cuda.threadIdx.x % warp_size
     block_acc = numba.cuda.shared.array(shape=32, dtype=numba.float32)
@@ -972,7 +976,10 @@ def softmax_autoregressive_backward_kernel(dpreatt, datt, att, B, T, C, scale):
             dpreatt_bth[t3] = scale * acc
 
 
-@numba.cuda.jit(fastmath=True)
+@numba.cuda.jit(
+    "void(float32[:], float32[:], float32[:], float32[:], int32, int32, int32, int32)",
+    fastmath=True,
+)
 def permute_kernel_backward(dinp, dq, dk, dv, B, N, NH, d):
     idx = numba.cuda.grid(1)
     if idx < B * NH * N * d:
@@ -1012,7 +1019,7 @@ def attention_backward(
     unpermute_kernel_backward[num_blocks, block_size](dvaccum, dout, B, T, NH, HS)
     # backward into datt
     cublas.sgemm_strided_batched(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.T,
         cublas.Operation.N,
         T,
@@ -1033,7 +1040,7 @@ def attention_backward(
     )
     # backward into dv
     cublas.sgemm_strided_batched(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.N,
         cublas.Operation.T,
         HS,
@@ -1061,7 +1068,7 @@ def attention_backward(
     )
     # backward into q
     cublas.sgemm_strided_batched(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.N,
         cublas.Operation.N,
         HS,
@@ -1082,7 +1089,7 @@ def attention_backward(
     )
     # backward into k
     cublas.sgemm_strided_batched(
-        cublas_handle,
+        CublasState.cublas_handle,
         cublas.Operation.N,
         cublas.Operation.T,
         HS,
@@ -1278,7 +1285,7 @@ class Tokenizer:
             assert header[1] == 1
             self.vocab_size = header[2]
             self.token_table = []
-            for i in range(self.vocab_size):
+            for _ in range(self.vocab_size):
                 length = f.read(1)[0]
                 token_bytes = f.read(length)
                 self.token_table.append(token_bytes)
@@ -1560,24 +1567,7 @@ class GPT2:
         self.seq_len = 0
         self.mean_loss = -1.0  # -1.0f will designate no loss
 
-    def forward(self, inputs, targets, B, T):
-        # ensure the model was initialized or error out
-        if self.params_memory is None:
-            raise RuntimeError("Error: model was not initialized properly.\n")
-
-        # convenience parameters
-        V = self.config.vocab_size
-        L = self.config.num_layers
-        NH = self.config.num_heads
-        C = self.config.channels
-
-        # Validate inputs, all indices must be in the range [0, V)
-        for i in range(B * T):
-            assert 0 <= inputs[i] < V
-            if targets is not None:
-                assert 0 <= targets[i] < V
-
-        # allocate space for all the activations if needed (done here, lazily)
+    def _initialize_acts(self, B, T):
         if self.acts_memory is None:
             # record the current B,T as well
             self.batch_size = B
@@ -1606,6 +1596,26 @@ class GPT2:
                 raise RuntimeError(
                     f"Model: B={self.batch_size} T={self.seq_len}, Desired: B={B} T={T}"
                 )
+
+    def forward(self, inputs, targets, B, T):
+        # ensure the model was initialized or error out
+        if self.params_memory is None:
+            raise RuntimeError("Error: model was not initialized properly.\n")
+
+        # convenience parameters
+        V = self.config.vocab_size
+        L = self.config.num_layers
+        NH = self.config.num_heads
+        C = self.config.channels
+
+        # Validate inputs, all indices must be in the range [0, V)
+        for i in range(B * T):
+            assert 0 <= inputs[i] < V
+            if targets is not None:
+                assert 0 <= targets[i] < V
+
+        # allocate space for all the activations if needed (done here, lazily)
+        self._initialize_acts(B, T)
 
         # copy inputs/targets to the model
         # We are just creating a new cupy array time, memory is drawn from the pool and the numpy array
@@ -1662,7 +1672,16 @@ class GPT2:
             )
             matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C)
             attention_forward(
-                l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH, l
+                l_atty,
+                l_v_accum,
+                l_qkvr,
+                l_preatt,
+                l_att,
+                l_qkv,
+                B,
+                T,
+                C,
+                NH,
             )
             matmul_forward_cublaslt(
                 l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C
@@ -1709,10 +1728,7 @@ class GPT2:
             self.grads_acts_memory.fill(0.0)
             self.grads_memory.fill(0.0)
 
-    def backward(self):
-        if self.mean_loss == -1.0:
-            raise RuntimeError("Error: must forward with targets before backward")
-
+    def _initialize_grads(self):
         if self.grads_memory is None:
             self.grads_memory = malloc_and_point(
                 self.grads, self.params_sizes, self.num_parameters
@@ -1730,11 +1746,11 @@ class GPT2:
             # copy the configuration but override number of layers to 1
             fill_in_activation_sizes(bw_act_sizes, self.batch_size, self.seq_len, cfg)
             # on top of that, some buffers are not needed at all, set their sizes to zero
-            bw_act_sizes[0] = 0  #  encoded
-            bw_act_sizes[2] = 0  #  ln1_mean
-            bw_act_sizes[3] = 0  #  ln1_rstd
-            bw_act_sizes[8] = 0  #  attproj
-            bw_act_sizes[9] = 0  #  residual2
+            bw_act_sizes[0] = 0  # encoded
+            bw_act_sizes[2] = 0  # ln1_mean
+            bw_act_sizes[3] = 0  # ln1_rstd
+            bw_act_sizes[8] = 0  # attproj
+            bw_act_sizes[9] = 0  # residual2
             bw_act_sizes[11] = 0  # ln2_mean
             bw_act_sizes[12] = 0  # ln2_rstd
             bw_act_sizes[18] = 0  # lnf_mean
@@ -1756,6 +1772,11 @@ class GPT2:
             # init gradients of parameters and activations to zero
             self.zero_grad()
 
+    def backward(self):
+        if self.mean_loss == -1.0:
+            raise RuntimeError("Error: must forward with targets before backward")
+
+        self._initialize_grads()
         # convenience shortcuts
         B = self.batch_size
         T = self.seq_len
@@ -2003,12 +2024,6 @@ class Logger:
 
 
 def main(args):
-    global cublaslt_workspace_size
-    global cublaslt_workspace
-    global cublas_compute_type
-    global cublas_handle
-    global cublaslt_handle
-
     # Default values
     input_dataset_prefix = args.input
     output_log_file = args.output
@@ -2039,20 +2054,22 @@ def main(args):
     print("[System]")
     print(f"Device {deviceIdx}: {deviceProp.name.decode('utf-8')}")
     # For nvmath errors are thrown in a pythonic way
-    cublas_handle = cublas.create()
-    cublaslt_handle = cublaslt.create()
+    CublasState.cublas_handle = cublas.create()
+    CublasState.cublaslt_handle = cublaslt.create()
     enable_tf32 = deviceProp.major >= 8
     print(f"enable_tf32: {enable_tf32}")
     if enable_tf32:
-        cublas_compute_type = cublas.ComputeType.COMPUTE_32F_FAST_TF32
+        CublasState.cublas_compute_type = cublas.ComputeType.COMPUTE_32F_FAST_TF32
         cublas_math_mode = cublas.Math.TF32_TENSOR_OP_MATH
     else:
-        cublas_compute_type = cublas.ComputeType.COMPUTE_32F
+        CublasState.cublas_compute_type = cublas.ComputeType.COMPUTE_32F
         cublas_math_mode = cublas.Math.DEFAULT_MATH
 
-    cublas.set_math_mode(cublas_handle, cublas_math_mode)
+    cublas.set_math_mode(CublasState.cublas_handle, cublas_math_mode)
     # setup the (global) cuBLASLt workspace
-    cublaslt_workspace = cupy.empty(cublaslt_workspace_size, dtype=cupy.uint8)
+    CublasState.cublaslt_workspace = cupy.empty(
+        CublasState.cublaslt_workspace_size, dtype=cupy.uint8
+    )
     model = GPT2()
     model.build_from_checkpoint("gpt2_124M.bin")
 
@@ -2091,7 +2108,7 @@ def main(args):
         if step % val_loss_every == 0 or last_step:
             val_loss = 0.0
             val_loader.reset()
-            for i in range(val_num_batches):
+            for _ in range(val_num_batches):
                 val_loader.next_batch()
                 model.forward(val_loader.inputs(), val_loader.targets(), B, T)
                 val_loss += model.mean_loss
