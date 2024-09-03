@@ -56,18 +56,19 @@ def checkCudaErrors(result):
 --------------------- FORWARD KERNELS ---------------------
 """
 
-patch.patch_numba_linker(lto=True)        
+patch.patch_numba_linker(lto=True)
 cx_warp_sum = cudax.warp.sum(numba.float32)
 sum_storage_bytes = cx_warp_sum.temp_storage_bytes
 cx_warp_files = cx_warp_sum.files
 
+
 def max_op(a, b):
     return a if a > b else b
+
 
 cx_warp_max = cudax.warp.reduce(numba.float32, max_op)
 max_storage_bytes = cx_warp_max.temp_storage_bytes
 cx_warp_files += cx_warp_max.files
-
 
 
 @numba.cuda.jit("float32(float32)", device=True, fastmath=True)
@@ -75,7 +76,6 @@ def warp_sum(val):
     temp_storage = numba.cuda.shared.array(shape=sum_storage_bytes, dtype=numba.uint8)
     warp_output = cx_warp_sum(temp_storage, val)
     return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
-
 
 
 @numba.cuda.jit("float32(float32)", device=True, fastmath=True)
@@ -293,7 +293,8 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
 
 
 @numba.cuda.jit(
-    "void(float32[:], float32, float32[:], float32, int32, int32)", fastmath=True,
+    "void(float32[:], float32, float32[:], float32, int32, int32)",
+    fastmath=True,
     link=cx_warp_files,
 )
 def softmax_forward_kernel5(out, inv_temperature, inp, flt_max, N, T):
@@ -527,7 +528,9 @@ def gelu_forward(out, inp, N):
 
 
 @numba.cuda.jit(
-    "UniTuple(float32, 2)(int32, float32[:], int32, int32)", device=True, fastmath=True,
+    "UniTuple(float32, 2)(int32, float32[:], int32, int32)",
+    device=True,
+    fastmath=True,
     link=cx_warp_files,
 )
 def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
@@ -587,7 +590,8 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
 
 
 @numba.cuda.jit(
-    "void(float32[:], float32[:], int32[:], int32, int32, int32, int32)", fastmath=True,
+    "void(float32[:], float32[:], int32[:], int32, int32, int32, int32)",
+    fastmath=True,
     link=cx_warp_files,
 )
 def fused_classifier_kernel3(logits, losses, targets, B, T, V, P):
@@ -621,7 +625,9 @@ def fused_classifier3(logits, losses, targets, B, T, V, P):
     fused_classifier_kernel3[grid_size, block_size](logits, losses, targets, B, T, V, P)
 
 
-@numba.cuda.jit("void(float32[:], float32[:], int32, int32)", fastmath=True,
+@numba.cuda.jit(
+    "void(float32[:], float32[:], int32, int32)",
+    fastmath=True,
     link=cx_warp_files,
 )
 def softmax_forward_kernel7(out, inp, N, C):
@@ -745,7 +751,9 @@ def softmax_forward(out, inp, N, C):
 """
 
 
-@numba.cuda.jit("void(float32[:], float32[:], int32, int32, int32)", fastmath=True,
+@numba.cuda.jit(
+    "void(float32[:], float32[:], int32, int32, int32)",
+    fastmath=True,
     link=cx_warp_files,
 )
 def matmul_backward_bias_kernel2(dbias, dout, B, T, OC):
