@@ -56,45 +56,33 @@ def checkCudaErrors(result):
 --------------------- FORWARD KERNELS ---------------------
 """
 
+patch.patch_numba_linker(lto=True)        
+cx_warp_sum = cudax.warp.sum(numba.float32)
+sum_storage_bytes = cx_warp_sum.temp_storage_bytes
+cx_warp_files = cx_warp_sum.files
 
-def compare_tensor(cupy_val, name, size, dtype=numpy.float32):
-    if True:
-        numpy_array = cupy.asnumpy(cupy_val[:size])
-        file_data = numpy.fromfile(f"outs/{name}", dtype=dtype)
-        print("Checking ", name)
-        # numpy.testing.assert_allclose(file_data, numpy_array, atol=1e-6)#, rtol=1e-01, atol=1e-01)
-        numpy.testing.assert_allclose(file_data, numpy_array)
+def max_op(a, b):
+    return a if a > b else b
 
+cx_warp_max = cudax.warp.reduce(numba.float32, max_op)
+max_storage_bytes = cx_warp_max.temp_storage_bytes
+cx_warp_files += cx_warp_max.files
 
-def replace_tensor(cupy_val, name, size, dtype=numpy.float32):
-    if True:
-        numpy_array = cupy.asnumpy(cupy_val[:size])
-        file_data = numpy.fromfile(f"outs/{name}", dtype=dtype)
-        print("Replacing ", name)
-        cupy_val[:size] = cupy.array(file_data)
-
-
-cx_warp_files = []
 
 
 @numba.cuda.jit("float32(float32)", device=True, fastmath=True)
 def warp_sum(val):
-    offset = 16
-    while offset > 0:
-        val += numba.cuda.shfl_xor_sync(0xFFFFFFFF, val, offset)
-        offset = offset // 2
-    return val
+    temp_storage = numba.cuda.shared.array(shape=sum_storage_bytes, dtype=numba.uint8)
+    warp_output = cx_warp_sum(temp_storage, val)
+    return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
+
 
 
 @numba.cuda.jit("float32(float32)", device=True, fastmath=True)
 def warp_max(val):
-    offset = 16
-    while offset > 0:
-        val = numba.cuda.libdevice.fmaxf(
-            val, numba.cuda.shfl_xor_sync(0xFFFFFFFF, val, offset)
-        )
-        offset = offset // 2
-    return val
+    temp_storage = numba.cuda.shared.array(shape=max_storage_bytes, dtype=numba.uint8)
+    warp_output = cx_warp_max(temp_storage, val)
+    return numba.cuda.shfl_sync(0xFFFFFFFF, warp_output, 0)
 
 
 fp32 = numpy.float32
@@ -103,6 +91,7 @@ fp32 = numpy.float32
 @numba.cuda.jit(
     "void(float32[:], float32[:], float32[:],float32[:], float32[:], float32[:], int32, int32)",
     fastmath=True,
+    link=cx_warp_files,
 )
 def layernorm_forward_kernel3(out, mean, rstd, inp, weight, bias, N, C):
     # This emulates the warp cg which is not available in numba
@@ -304,7 +293,8 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
 
 
 @numba.cuda.jit(
-    "void(float32[:], float32, float32[:], float32, int32, int32)", fastmath=True
+    "void(float32[:], float32, float32[:], float32, int32, int32)", fastmath=True,
+    link=cx_warp_files,
 )
 def softmax_forward_kernel5(out, inv_temperature, inp, flt_max, N, T):
     # inp, out shape: (N, T, T), where N = B * NH
@@ -537,7 +527,8 @@ def gelu_forward(out, inp, N):
 
 
 @numba.cuda.jit(
-    "UniTuple(float32, 2)(int32, float32[:], int32, int32)", device=True, fastmath=True
+    "UniTuple(float32, 2)(int32, float32[:], int32, int32)", device=True, fastmath=True,
+    link=cx_warp_files,
 )
 def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
     x = inp[idx * P :]
@@ -596,7 +587,8 @@ def prepare_softmax_blockwide_nofloat4(idx, inp, V, P):
 
 
 @numba.cuda.jit(
-    "void(float32[:], float32[:], int32[:], int32, int32, int32, int32)", fastmath=True
+    "void(float32[:], float32[:], int32[:], int32, int32, int32, int32)", fastmath=True,
+    link=cx_warp_files,
 )
 def fused_classifier_kernel3(logits, losses, targets, B, T, V, P):
     idx = numba.cuda.blockIdx.x
@@ -629,7 +621,9 @@ def fused_classifier3(logits, losses, targets, B, T, V, P):
     fused_classifier_kernel3[grid_size, block_size](logits, losses, targets, B, T, V, P)
 
 
-@numba.cuda.jit("void(float32[:], float32[:], int32, int32)", fastmath=True)
+@numba.cuda.jit("void(float32[:], float32[:], int32, int32)", fastmath=True,
+    link=cx_warp_files,
+)
 def softmax_forward_kernel7(out, inp, N, C):
     warp_size = 32
     meta_group_size = numba.cuda.blockDim.x // warp_size
@@ -751,7 +745,9 @@ def softmax_forward(out, inp, N, C):
 """
 
 
-@numba.cuda.jit("void(float32[:], float32[:], int32, int32, int32)", fastmath=True)
+@numba.cuda.jit("void(float32[:], float32[:], int32, int32, int32)", fastmath=True,
+    link=cx_warp_files,
+)
 def matmul_backward_bias_kernel2(dbias, dout, B, T, OC):
     # dout is (B, T, OC), dbias is (OC)
     # e.g. if block_size = 128, then we have 4 warps per block, each in charge of one output channel
@@ -823,6 +819,7 @@ def matmul_backward(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC):
 @numba.cuda.jit(
     "void(float32[:], float32[:], float32[:], float32[:], float32[:], float32[:], float32[:], float32[:], int32, int32, int32)",
     fastmath=True,
+    link=cx_warp_files,
 )
 def layernorm_backward_kernel(
     dinp, dweight, dbias, dout, inp, weight, mean, rstd, B, T, C
@@ -923,6 +920,7 @@ def unpermute_kernel_backward(dinp, dout, B, N, NH, d):
 @numba.cuda.jit(
     "void(float32[:], float32[:], float32[:], int32, int32, int32, float32)",
     fastmath=True,
+    link=cx_warp_files,
 )
 def softmax_autoregressive_backward_kernel(dpreatt, datt, att, B, T, C, scale):
     BlockSize = 256
