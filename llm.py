@@ -245,18 +245,7 @@ def matmul_forward_cublaslt(out, inp, weight, bias, B, T, C, OC):
     )
     algorithms_buffer = numpy.zeros((1,), dtype=algorithm_dtype)
     num_algorithms = numpy.zeros((1,), dtype=numpy.int32)
-    cublaslt.matmul_algo_get_heuristic(
-        CublasState.cublaslt_handle,
-        operation_desc,
-        weight_layout,
-        input_layout,
-        output_layout,
-        output_layout,
-        preference,
-        1,
-        algorithms_buffer.ctypes.data,
-        num_algorithms.ctypes.data,
-    )
+    cublaslt.matmul_algo_get_heuristic( CublasState.cublaslt_handle, operation_desc, weight_layout, input_layout, output_layout, output_layout, preference, 1, algorithms_buffer.ctypes.data, num_algorithms.ctypes.data)
     if num_algorithms[0] == 0:
         raise RuntimeError(
             f"No cuBLASLt algorithm: B: {B}, T: {T}, C: {C}, OC: {OC}, bias: {has_bias}"
@@ -414,26 +403,7 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
     # batched matrix multiply using cuBLAS
     alpha = numpy.array(1.0, dtype=numpy.float32)
     beta = numpy.array(0.0, dtype=numpy.float32)
-    cublas.sgemm_strided_batched(
-        CublasState.cublas_handle,
-        cublas.Operation.T,
-        cublas.Operation.N,
-        T,
-        T,
-        HS,
-        alpha.ctypes.data,
-        k.data.ptr,
-        HS,
-        T * HS,
-        q.data.ptr,
-        HS,
-        T * HS,
-        beta.ctypes.data,
-        preatt.data.ptr,
-        T,
-        T * T,
-        B * NH,
-    )
+    cublas.sgemm_strided_batched(CublasState.cublas_handle, cublas.Operation.T, cublas.Operation.N, T, T, HS, alpha.ctypes.data, k.data.ptr, HS, T * HS, q.data.ptr, HS, T * HS, beta.ctypes.data, preatt.data.ptr, T, T * T, B * NH)
 
     scale = numpy.array(1.0, dtype=numpy.float32) / numpy.sqrt(
         numpy.array(HS, dtype=numpy.int32)
@@ -445,26 +415,7 @@ def attention_forward(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH):
     )
     # new approach: first cuBLAS another batched matmul
     # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublas.sgemm_strided_batched(
-        CublasState.cublas_handle,
-        cublas.Operation.N,
-        cublas.Operation.N,
-        HS,
-        T,
-        T,
-        alpha.ctypes.data,
-        v.data.ptr,
-        HS,
-        T * HS,
-        att.data.ptr,
-        T,
-        T * T,
-        beta.ctypes.data,
-        vaccum.data.ptr,
-        HS,
-        T * HS,
-        B * NH,
-    )
+    cublas.sgemm_strided_batched(CublasState.cublas_handle, cublas.Operation.N, cublas.Operation.N, HS, T, T, alpha.ctypes.data, v.data.ptr, HS, T * HS, att.data.ptr, T, T * T, beta.ctypes.data, vaccum.data.ptr, HS, T * HS, B * NH)
 
     # now unpermute
     # y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -787,39 +738,9 @@ def matmul_backward(dinp, dweight, dbias, dout, inp, weight, B, T, C, OC):
     one = numpy.array(1.0, dtype=numpy.float32)
     zero = numpy.array(0.0, dtype=numpy.float32)
     # backward to input, uses = in the backward pass (set the gradient)
-    cublas.sgemm(
-        CublasState.cublas_handle,
-        cublas.Operation.N,
-        cublas.Operation.N,
-        C,
-        B * T,
-        OC,
-        one.ctypes.data,
-        weight.data.ptr,
-        C,
-        dout.data.ptr,
-        OC,
-        zero.ctypes.data,
-        dinp.data.ptr,
-        C,
-    )
+    cublas.sgemm(CublasState.cublas_handle, cublas.Operation.N, cublas.Operation.N, C, B * T, OC, one.ctypes.data, weight.data.ptr, C, dout.data.ptr, OC, zero.ctypes.data, dinp.data.ptr, C)
     # backward to weight, uses += in the backward pass (accumulate the gradient)
-    cublas.sgemm(
-        CublasState.cublas_handle,
-        cublas.Operation.N,
-        cublas.Operation.T,
-        C,
-        OC,
-        B * T,
-        one.ctypes.data,
-        inp.data.ptr,
-        C,
-        dout.data.ptr,
-        OC,
-        one.ctypes.data,
-        dweight.data.ptr,
-        C,
-    )
+    cublas.sgemm(CublasState.cublas_handle, cublas.Operation.N, cublas.Operation.T, C, OC, B * T, one.ctypes.data, inp.data.ptr, C, dout.data.ptr, OC, one.ctypes.data, dweight.data.ptr, C)
     # backward to bias, if given, does a +=
     if dbias is not None:
         block_size = 512
@@ -1018,47 +939,9 @@ def attention_backward(
     num_blocks = ceil_div(B * T * C, block_size)
     unpermute_kernel_backward[num_blocks, block_size](dvaccum, dout, B, T, NH, HS)
     # backward into datt
-    cublas.sgemm_strided_batched(
-        CublasState.cublas_handle,
-        cublas.Operation.T,
-        cublas.Operation.N,
-        T,
-        T,
-        HS,
-        one.ctypes.data,
-        v.data.ptr,
-        HS,
-        T * HS,
-        dvaccum.data.ptr,
-        HS,
-        T * HS,
-        zero.ctypes.data,
-        datt.data.ptr,
-        T,
-        T * T,
-        B * NH,
-    )
+    cublas.sgemm_strided_batched(CublasState.cublas_handle, cublas.Operation.T, cublas.Operation.N, T, T, HS, one.ctypes.data, v.data.ptr, HS, T * HS, dvaccum.data.ptr, HS, T * HS, zero.ctypes.data, datt.data.ptr, T, T * T, B * NH)
     # backward into dv
-    cublas.sgemm_strided_batched(
-        CublasState.cublas_handle,
-        cublas.Operation.N,
-        cublas.Operation.T,
-        HS,
-        T,
-        T,
-        one.ctypes.data,
-        dvaccum.data.ptr,
-        HS,
-        T * HS,
-        att.data.ptr,
-        T,
-        T * T,
-        zero.ctypes.data,
-        dv.data.ptr,
-        HS,
-        T * HS,
-        B * NH,
-    )
+    cublas.sgemm_strided_batched(CublasState.cublas_handle, cublas.Operation.N, cublas.Operation.T, HS, T, T, one.ctypes.data, dvaccum.data.ptr, HS, T * HS, att.data.ptr, T, T * T, zero.ctypes.data, dv.data.ptr, HS, T * HS, B * NH)
     # backward into preatt
     scale = numpy.array(1.0, dtype=numpy.float32) / numpy.sqrt(
         numpy.array(HS, dtype=numpy.int32)
@@ -1067,48 +950,9 @@ def attention_backward(
         dpreatt, datt, att, B, T, C, scale
     )
     # backward into q
-    cublas.sgemm_strided_batched(
-        CublasState.cublas_handle,
-        cublas.Operation.N,
-        cublas.Operation.N,
-        HS,
-        T,
-        T,
-        one.ctypes.data,
-        k.data.ptr,
-        HS,
-        T * HS,
-        dpreatt.data.ptr,
-        T,
-        T * T,
-        zero.ctypes.data,
-        dq.data.ptr,
-        HS,
-        T * HS,
-        B * NH,
-    )
+    cublas.sgemm_strided_batched(CublasState.cublas_handle, cublas.Operation.N, cublas.Operation.N, HS, T, T, one.ctypes.data, k.data.ptr, HS, T * HS, dpreatt.data.ptr, T, T * T, zero.ctypes.data, dq.data.ptr, HS, T * HS, B * NH)
     # backward into k
-    cublas.sgemm_strided_batched(
-        CublasState.cublas_handle,
-        cublas.Operation.N,
-        cublas.Operation.T,
-        HS,
-        T,
-        T,
-        one.ctypes.data,
-        q.data.ptr,
-        HS,
-        T * HS,
-        dpreatt.data.ptr,
-        T,
-        T * T,
-        zero.ctypes.data,
-        dk.data.ptr,
-        HS,
-        T * HS,
-        B * NH,
-    )
-    # backward into inp
+    cublas.sgemm_strided_batched(CublasState.cublas_handle, cublas.Operation.N, cublas.Operation.T, HS, T, T, one.ctypes.data, q.data.ptr, HS, T * HS, dpreatt.data.ptr, T, T * T, zero.ctypes.data, dk.data.ptr, HS, T * HS, B * NH) # backward into inp
     num_blocks = ceil_div(B * NH * T * HS, block_size)
     permute_kernel_backward[num_blocks, block_size](dinp, dq, dk, dv, B, T, NH, HS)
 
@@ -1267,16 +1111,6 @@ class Tokenizer:
 
     def init(self, filename):
         with open(filename, "rb") as f:
-            # if (file == NULL) {
-            #     // try to be more helpful as we just added this feature, erase later
-            #     printf("---\n");
-            #     printf("WARNING: Failed to open the tokenizer file %s\n", filename);
-            #     printf("The Tokenizer is a new feature added April 14 2024.\n");
-            #     printf("Re-run `python train_gpt2.py` to write it\n");
-            #     printf("---\n");
-            #     tokenizer->init_ok = 0;
-            #     return;
-            # }
             header_fmt = "256i"
             header_len = struct.calcsize(header_fmt)
             header_unpack = struct.Struct(header_fmt).unpack_from
@@ -1667,50 +1501,19 @@ class GPT2:
             l_preatt = acts.preatt
             l_v_accum = acts.v_accum
 
-            layernorm_forward(
-                l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C
-            )
+            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C)
             matmul_forward_cublaslt(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C)
-            attention_forward(
-                l_atty,
-                l_v_accum,
-                l_qkvr,
-                l_preatt,
-                l_att,
-                l_qkv,
-                B,
-                T,
-                C,
-                NH,
-            )
-            matmul_forward_cublaslt(
-                l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C
-            )
+            attention_forward(l_atty, l_v_accum, l_qkvr, l_preatt, l_att, l_qkv, B, T, C, NH)
+            matmul_forward_cublaslt(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C)
             residual_forward(l_residual2, residual, l_attproj, B * T * C)
-            layernorm_forward(
-                l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C
-            )
+            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C)
             matmul_forward_cublaslt(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C)
             gelu_forward(l_fch_gelu, l_fch, B * T * 4 * C)
-            matmul_forward_cublaslt(
-                l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C
-            )
+            matmul_forward_cublaslt(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C)
             residual_forward(l_residual3, l_residual2, l_fcproj, B * T * C)
 
-        residual = acts.residual3[
-            (L - 1) * B * T * C :
-        ]  # last residual is in residual3
-        layernorm_forward(
-            acts.lnf,
-            acts.lnf_mean,
-            acts.lnf_rstd,
-            residual,
-            params.lnfw,
-            params.lnfb,
-            B,
-            T,
-            C,
-        )
+        residual = acts.residual3[(L - 1) * B * T * C :]  # last residual is in residual3
+        layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C)
         matmul_forward_cublas(acts.logits, acts.lnf, params.wte, None, B, T, C, V)
         if targets is not None:
             fused_classifier3(
@@ -1796,37 +1599,10 @@ class GPT2:
         # technically that is a small, inline backward() pass of calculating
         # total, final loss as the mean over all losses over all (B,T) positions in the batch
         # next: backward the classifier matmul
-        matmul_backward(
-            grads_acts.lnf,
-            grads.wte,
-            None,
-            acts.logits,
-            acts.lnf,
-            params.wte,
-            B,
-            T,
-            C,
-            V,
-        )
-        residual = acts.residual3[
-            (L - 1) * B * T * C :
-        ]  # last residual is in residual3
-        dresidual = (
-            grads_acts.residual3
-        )  # the main buffer holding the gradient in the backward pass
-        layernorm_backward(
-            dresidual,
-            grads.lnfw,
-            grads.lnfb,
-            grads_acts.lnf,
-            residual,
-            params.lnfw,
-            acts.lnf_mean,
-            acts.lnf_rstd,
-            B,
-            T,
-            C,
-        )
+        matmul_backward(grads_acts.lnf, grads.wte, None, acts.logits, acts.lnf, params.wte, B, T, C, V)
+        residual = acts.residual3[(L - 1) * B * T * C :]  # last residual is in residual3
+        dresidual = (grads_acts.residual3)  # the main buffer holding the gradient in the backward pass
+        layernorm_backward(dresidual, grads.lnfw, grads.lnfb, grads_acts.lnf, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C)
         for l in range(L - 1, -1, -1):
             residual = acts.encoded if l == 0 else acts.residual3[(l - 1) * B * T * C :]
             # get the pointers of the weights for this layer
@@ -1877,80 +1653,16 @@ class GPT2:
             dl_fch = grads_acts.fch
             dl_fch_gelu = grads_acts.fch_gelu
 
-            matmul_backward(
-                dl_fch_gelu,
-                dl_fcprojw,
-                dl_fcprojb,
-                dresidual,
-                l_fch_gelu,
-                l_fcprojw,
-                B,
-                T,
-                4 * C,
-                C,
-            )
+            matmul_backward(dl_fch_gelu, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, B, T, 4 * C, C)
             gelu_backward(dl_fch, l_fch, dl_fch_gelu, B * T * 4 * C)
-            matmul_backward(
-                dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4 * C
-            )
+            matmul_backward(dl_ln2, dl_fcw, dl_fcb, dl_fch, l_ln2, l_fcw, B, T, C, 4 * C)
             # layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-            layernorm_backward(
-                dresidual,
-                dl_ln2w,
-                dl_ln2b,
-                dl_ln2,
-                l_residual2,
-                l_ln2w,
-                l_ln2_mean,
-                l_ln2_rstd,
-                B,
-                T,
-                C,
-            )
-            matmul_backward(
-                dl_atty,
-                dl_attprojw,
-                dl_attprojb,
-                dresidual,
-                l_atty,
-                l_attprojw,
-                B,
-                T,
-                C,
-                C,
-            )
-            attention_backward(
-                dl_qkv,
-                dl_qkvr,
-                dl_preatt,
-                dl_att,
-                dl_v_accum,
-                dl_atty,
-                l_qkv,
-                l_qkvr,
-                l_att,
-                B,
-                T,
-                C,
-                NH,
-            )
-            matmul_backward(
-                dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3 * C
-            )
+            layernorm_backward(dresidual, dl_ln2w, dl_ln2b, dl_ln2, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C)
+            matmul_backward(dl_atty, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, B, T, C, C)
+            attention_backward(dl_qkv, dl_qkvr, dl_preatt, dl_att, dl_v_accum, dl_atty, l_qkv, l_qkvr, l_att, B, T, C, NH)
+            matmul_backward(dl_ln1, dl_qkvw, dl_qkvb, dl_qkv, l_ln1, l_qkvw, B, T, C, 3 * C)
             # layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-            layernorm_backward(
-                dresidual,
-                dl_ln1w,
-                dl_ln1b,
-                dl_ln1,
-                residual,
-                l_ln1w,
-                l_ln1_mean,
-                l_ln1_rstd,
-                B,
-                T,
-                C,
-            )
+            layernorm_backward(dresidual, dl_ln1w, dl_ln1b, dl_ln1, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C)
 
         encoder_backward(grads.wte, grads.wpe, dresidual, self.inputs, B, T, C)
 
@@ -2023,6 +1735,134 @@ class Logger:
                 self.buffer = []
 
 
+def validation(model, val_loader, val_num_batches, B, T):
+    val_loss = 0.0
+    val_loader.reset()
+    for _ in range(val_num_batches):
+        val_loader.next_batch()
+        model.forward(val_loader.inputs(), val_loader.targets(), B, T)
+        val_loss += model.mean_loss
+    val_loss /= val_num_batches
+    return val_loss
+
+
+def inference(model, tokenizer, genT, B, T):
+    gen_tokens = numpy.empty(B * T, dtype=numpy.int32)
+    cpu_probs = numpy.empty(model.config.vocab_size, dtype=numpy.float32)
+    GPT2_EOT = 50256
+
+    # fill up gen_tokens with the GPT2_EOT, which kicks off the generation
+    for i in range(B * T):
+        gen_tokens[i] = GPT2_EOT
+
+    # now sample from the model autoregressively
+    print("generating:\n---")
+    token_str = bytearray(b"")
+    for t in range(1, genT):
+        # note that inference is very wasteful here because for each token
+        # we re-calculate the forward pass for all of (B,T) positions from scratch
+        # but the inference here is just for sanity checking anyway
+        # and we can maybe optimize a bit more later, with careful tests
+        model.forward(gen_tokens, None, B, T)
+        # furthermore, below we're only using b=0 (i.e. the first row) of all B rows
+        # we're in principle running B "inference streams" in parallel here
+        # only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
+        # get the V-dimensional vector probs[0, t-1, :]
+        probs = model.acts.probs[(t - 1) * model.config.vocab_size :]
+        # move probs back to CPU and sample
+        cupy.cuda.runtime.memcpy(
+            cpu_probs.ctypes.data,
+            probs.data.ptr,
+            model.config.vocab_size * probs.itemsize,
+            cupy.cuda.runtime.memcpyDeviceToHost,
+        )
+        coin = numpy.random.random_sample()
+        next_token = sample_mult(cpu_probs, model.config.vocab_size, coin)
+        gen_tokens[t] = next_token
+        # print the generated token, either using the Tokenizer or a fallback
+        if tokenizer.init_ok:
+            token_str.extend(tokenizer.decode(next_token))
+    print(token_str.decode("utf-8"))
+
+
+def train_loop(
+    model,
+    tokenizer,
+    train_loader,
+    val_loader,
+    logger,
+    learning_rate,
+    genT,
+    val_loss_every,
+    val_max_batches,
+    sample_every,
+    B,
+    T,
+):
+    train_num_batches = train_loader.num_batches  # let's do 1 epoch by default
+    val_num_batches = (
+        train_loader.num_batches
+        if train_loader.num_batches < val_max_batches
+        else val_max_batches
+    )
+
+    for step in range(train_num_batches + 1):
+        last_step = step == train_num_batches
+        # once in a while estimate the validation loss
+        if step % val_loss_every == 0 or last_step:
+            val_loss = validation(model, val_loader, val_num_batches, B, T)
+            print(f"val loss {val_loss}")
+            logger.log_val(step, val_loss)
+
+        # once in a while do model inference to print generated text
+        if step > 0 and step % sample_every == 0 or last_step:
+            inference(model, tokenizer, genT, B, T)
+
+        if last_step:
+            break
+
+        start = time.time()
+        train_loader.next_batch()
+
+        model.forward(train_loader.inputs(), train_loader.targets(), B, T)
+        model.zero_grad()
+        model.backward()
+        model.update(learning_rate, 0.9, 0.999, 1e-8, 0.0, step + 1)
+
+        print(
+            f"step {step+1}/{train_num_batches}: train loss {model.mean_loss} ({int((time.time() - start)*1000)} ms)"
+        )
+        logger.log_train(step, model.mean_loss)
+
+
+def setup_cuda():
+    deviceIdx = 0
+    checkCudaErrors(cudart.cudaSetDevice(deviceIdx))
+    deviceProp = checkCudaErrors(cudart.cudaGetDeviceProperties(deviceIdx))
+    print("[System]")
+    print(f"Device {deviceIdx}: {deviceProp.name.decode('utf-8')}")
+    # For nvmath errors are thrown in a pythonic way
+    enable_tf32 = deviceProp.major >= 8
+    print(f"enable_tf32: {enable_tf32}")
+    setup_cublas(enable_tf32)
+
+
+def setup_cublas(enable_tf32):
+    CublasState.cublas_handle = cublas.create()
+    CublasState.cublaslt_handle = cublaslt.create()
+    if enable_tf32:
+        CublasState.cublas_compute_type = cublas.ComputeType.COMPUTE_32F_FAST_TF32
+        cublas_math_mode = cublas.Math.TF32_TENSOR_OP_MATH
+    else:
+        CublasState.cublas_compute_type = cublas.ComputeType.COMPUTE_32F
+        cublas_math_mode = cublas.Math.DEFAULT_MATH
+    cublas.set_math_mode(CublasState.cublas_handle, cublas_math_mode)
+    # setup the (global) cuBLASLt workspace
+    CublasState.cublaslt_workspace = cupy.empty(
+        CublasState.cublaslt_workspace_size, dtype=cupy.uint8
+    )
+
+
 def main(args):
     # Default values
     input_dataset_prefix = args.input
@@ -2045,31 +1885,13 @@ def main(args):
     print(f"sample_every: {sample_every}")
     print(f"genT: {genT}")
 
+    # This is needed to avoid stream sync on each kernel that takes cupy arrays as the input
     numba.config.CUDA_ARRAY_INTERFACE_SYNC = False
 
-    # set up the device
-    deviceIdx = 0
-    checkCudaErrors(cudart.cudaSetDevice(deviceIdx))
-    deviceProp = checkCudaErrors(cudart.cudaGetDeviceProperties(deviceIdx))
-    print("[System]")
-    print(f"Device {deviceIdx}: {deviceProp.name.decode('utf-8')}")
-    # For nvmath errors are thrown in a pythonic way
-    CublasState.cublas_handle = cublas.create()
-    CublasState.cublaslt_handle = cublaslt.create()
-    enable_tf32 = deviceProp.major >= 8
-    print(f"enable_tf32: {enable_tf32}")
-    if enable_tf32:
-        CublasState.cublas_compute_type = cublas.ComputeType.COMPUTE_32F_FAST_TF32
-        cublas_math_mode = cublas.Math.TF32_TENSOR_OP_MATH
-    else:
-        CublasState.cublas_compute_type = cublas.ComputeType.COMPUTE_32F
-        cublas_math_mode = cublas.Math.DEFAULT_MATH
+    numpy.random.seed(1336)
 
-    cublas.set_math_mode(CublasState.cublas_handle, cublas_math_mode)
-    # setup the (global) cuBLASLt workspace
-    CublasState.cublaslt_workspace = cupy.empty(
-        CublasState.cublaslt_workspace_size, dtype=cupy.uint8
-    )
+    setup_cuda()
+
     model = GPT2()
     model.build_from_checkpoint("gpt2_124M.bin")
 
@@ -2081,87 +1903,30 @@ def main(args):
     val_loader = DataLoader()
     val_loader.init(val_tokens_filename, B, T)
 
-    train_num_batches = train_loader.num_batches  # let's do 1 epoch by default
-    val_num_batches = (
-        train_loader.num_batches
-        if train_loader.num_batches < val_max_batches
-        else val_max_batches
-    )
     print(
         f"train dataset num_batches: {train_loader.num_batches}",
         train_loader.num_batches,
     )
     print(f"val dataset num_batches: {val_loader.num_batches}", val_loader.num_batches)
 
-    logger = Logger(output_log_file)
-
-    gen_tokens = numpy.zeros(B * T, dtype=numpy.int32)
-    cpu_probs = numpy.zeros(model.config.vocab_size, dtype=numpy.float32)
-    GPT2_EOT = 50256
-    numpy.random.seed(1336)
     tokenizer = Tokenizer()
     tokenizer.init("gpt2_tokenizer.bin")
+    logger = Logger(output_log_file)
 
-    for step in range(train_num_batches + 1):
-        last_step = step == train_num_batches
-        # once in a while estimate the validation loss
-        if step % val_loss_every == 0 or last_step:
-            val_loss = 0.0
-            val_loader.reset()
-            for _ in range(val_num_batches):
-                val_loader.next_batch()
-                model.forward(val_loader.inputs(), val_loader.targets(), B, T)
-                val_loss += model.mean_loss
-            val_loss /= val_num_batches
-            print(f"val loss {val_loss}")
-            logger.log_val(step, val_loss)
-
-        # once in a while do model inference to print generated text
-        if step > 0 and step % sample_every == 0 or last_step:
-            # fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for i in range(B * T):
-                gen_tokens[i] = GPT2_EOT
-            # now sample from the model autoregressively
-            print("generating:\n---")
-            token_str = bytearray(b"")
-            for t in range(1, genT):
-                # note that inference is very wasteful here because for each token
-                # we re-calculate the forward pass for all of (B,T) positions from scratch
-                # but the inference here is just for sanity checking anyway
-                # and we can maybe optimize a bit more later, with careful tests
-                model.forward(gen_tokens, None, B, T)
-                # furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                # we're in principle running B "inference streams" in parallel here
-                # only using position 0 because it's a bit faster (copy less probs from GPU -> CPU)
-                # get the V-dimensional vector probs[0, t-1, :]
-                probs = model.acts.probs[(t - 1) * model.config.vocab_size :]
-                # move probs back to CPU and sample
-                cupy.cuda.runtime.memcpy(
-                    cpu_probs.ctypes.data,
-                    probs.data.ptr,
-                    model.config.vocab_size * probs.itemsize,
-                    cupy.cuda.runtime.memcpyDeviceToHost,
-                )
-                coin = numpy.random.random_sample()
-                next_token = sample_mult(cpu_probs, model.config.vocab_size, coin)
-                gen_tokens[t] = next_token
-                # print the generated token, either using the Tokenizer or a fallback
-                if tokenizer.init_ok:
-                    token_str.extend(tokenizer.decode(next_token))
-            print(token_str.decode("utf-8"))
-        if last_step:
-            break
-        start = time.time()
-        train_loader.next_batch()
-
-        model.forward(train_loader.inputs(), train_loader.targets(), B, T)
-        model.zero_grad()
-        model.backward()
-        model.update(learning_rate, 0.9, 0.999, 1e-8, 0.0, step + 1)
-        print(
-            f"step {step+1}/{train_num_batches}: train loss {model.mean_loss} ({int((time.time() - start)*1000)} ms)"
-        )
-        logger.log_train(step, model.mean_loss)
+    train_loop(
+        model,
+        tokenizer,
+        train_loader,
+        val_loader,
+        logger,
+        learning_rate,
+        genT,
+        val_loss_every,
+        val_max_batches,
+        sample_every,
+        B,
+        T,
+    )
 
 
 if __name__ == "__main__":
